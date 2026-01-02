@@ -32,6 +32,13 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 telegram_bot = None
 update_offset = None
 running = True  # สำหรับ graceful shutdown
+# เรียก init เพื่อให้ colorama ทำงานบน Windows ได้ดี
+init(autoreset=True)
+
+# Global variables ที่ต้องประกาศนอกฟังก์ชัน
+prev_prices = {}
+ticker_offset = 0
+ticker_direction = 1  # 1 = เลื่อนไปทางซ้าย, -1 = เลื่อนไปทางขวา (จะสุ่มเปลี่ยนทิศบางครั้ง)
 
 # ตัวแปรสถานะบอท (global เพื่อให้ Telegram เข้าถึงได้)
 bal = 0.0
@@ -41,6 +48,11 @@ pending_orders_detail = []
 sym_info = {}
 sym_filters = {}
 prev_active_symbols = set()  # <--- เพิ่มสำหรับตรวจจับ Position ใหม่
+
+# เพิ่มตัวแปรสำหรับ Top 50 Volume
+top_50_symbols = []
+last_volume_update = datetime.min
+VOLUME_UPDATE_INTERVAL = timedelta(hours=4)  # อัปเดตทุก 4 ชั่วโมง
 
 if TELEGRAM_BOT_TOKEN:
     try:
@@ -65,34 +77,39 @@ if not API_KEY or not API_SECRET:
 USE_TESTNET = False
 
 MEMORY_FILE = "titan_memory.json"
-# ==========================================================================
-#                         OPTIMIZED CONFIG FOR $30
-# ==========================================================================
-MAX_LEVERAGE = 50
-RISK_PER_TRADE_PERCENT = 0.02  # เสี่ยง 1% ต่อไม้
 
-MAX_OPEN_POSITIONS = 3
+# ==========================================================================
+#                  OPTIMIZED CONFIG FOR $40 BALANCE
+# ==========================================================================
+MAX_LEVERAGE = 30  # ลดเหลือ 30x เพื่อความปลอดภัยกับทุนน้อย (ลด margin ใช้, ลด liquidation risk)
+RISK_PER_TRADE_PERCENT = 0.025  # เสี่ยง 2.5% ต่อไม้ (จากเดิม 2% → เพิ่มนิดเพื่อให้เปิด position ได้ง่ายขึ้น)
+
+MAX_OPEN_POSITIONS = 4
 SIGNAL_THRESHOLD_LONG = 6
 SIGNAL_THRESHOLD_SHORT = 7
 ADX_THRESHOLD = 25
 SCAN_BATCH_SIZE = 60
 MIN_NOTIONAL_USDT = 5
-MIN_BALANCE_TO_TRADE = 10.0
+MIN_BALANCE_TO_TRADE = 15.0  # ต้องมีอย่างน้อย $15 เพื่อเริ่มเทรด (ปลอดภัยกว่า)
 
 # --- LIMIT ENTRY SETTINGS ---
-ENTRY_PULLBACK_PERCENT =5.8
+ENTRY_PULLBACK_PERCENT = 5.8
 LIMIT_ORDER_TIMEOUT_HOURS = 2
 
 # SL/TP Settings
 ATR_SL_MULTIPLIER = 3.0
 ATR_TP_MULTIPLIER = 6.0  # RR 1:2
 
-MAJOR_SYMBOLS = {
+# ลบ MAJOR_SYMBOLS ออก เพราะใช้ Top 50 Volume แทน
+# สำหรับ Major Ticker
+MAJOR_TICKER_SYMBOLS  = [
     'BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'XRPUSDT', 'ADAUSDT',
     'DOGEUSDT', 'AVAXUSDT', 'LINKUSDT', 'DOTUSDT', 'TRXUSDT', 'MATICUSDT',
-    'LTCUSDT', 'BCHUSDT', 'NEARUSDT', 'UNIUSDT', 'SUIUSDT', 'APTUSDT'
-}
+    'LTCUSDT', 'BCHUSDT', 'NEARUSDT', 'UNIUSDT', 'SUIUSDT', 'APTUSDT']
 
+
+prev_prices = {sym: 0.0 for sym in MAJOR_TICKER_SYMBOLS}  # เก็บราคาครั้งก่อนเพื่อหา up/down
+ticker_offset = 0  # สำหรับเอฟเฟกต์ไหล
 # ==========================================================================
 #                   NATIVE INDICATORS
 # ==========================================================================
@@ -275,120 +292,184 @@ async def send_telegram_report(text, chat_id=None):
         print(f"{Fore.RED}Telegram send error: {e}")
 
 # ==========================================================================
-#                           DASHBOARD
+#                           DASHBOARD (อัปเดตเวลาแบบ Real-time + นับถอยหลังสวย)
 # ==========================================================================
 def print_dashboard(balance, active_positions, pending_orders, price_map, btc_price, scanning=False):
+    global prev_prices, ticker_offset, ticker_direction
+    
     os.system('cls' if os.name == 'nt' else 'clear')
     
+    # --- Calculations ---
     total_pnl = sum(p['pnl'] for p in active_positions)
     pnl_color = Fore.GREEN if total_pnl >= 0 else Fore.RED
-    status_str = f"{Fore.GREEN}SCANNING..." if scanning else f"{Fore.LIGHTBLACK_EX}IDLE"
-    mode_str = f"{Back.YELLOW}{Fore.BLACK} TESTNET " if USE_TESTNET else f"{Back.RED}{Fore.WHITE} LIVE "
+    bright_pnl = Style.BRIGHT if abs(total_pnl) > 100 else Style.NORMAL  # Pulse เมื่อ PNL มาก
+    status_spinners = ["│", "/", "−", "\\"]
+    spinner_idx = int(datetime.now().timestamp() * 8) % 4
+    spinner = status_spinners[spinner_idx]
+    status_str = f"{Fore.GREEN}{Style.BRIGHT}{spinner} SCANNING{Style.RESET_ALL}" if scanning else f"{Fore.LIGHTBLACK_EX}○ IDLE"
+    mode_str = f"{Back.YELLOW}{Fore.BLACK}{Style.BRIGHT} 🧪 TESTNET {Style.RESET_ALL}" if USE_TESTNET else f"{Back.RED}{Fore.WHITE}{Style.BRIGHT} ⚡ LIVE {Style.RESET_ALL}"
+    time_now = datetime.now().strftime('%H:%M:%S')
 
-    print(f"{Fore.CYAN}{'='*190}")
-    print(f" {mode_str} TITAN LIMIT SWING v31.2 | {Fore.CYAN}{datetime.now().strftime('%H:%M:%S')}")
-    print(f" {Fore.WHITE} BALANCE: {Fore.YELLOW}{balance:,.2f} USDT | PNL: {pnl_color}{total_pnl:+,.2f} USDT | BTC: {Fore.YELLOW}{btc_price:,.0f}")
-    print(f" {Fore.WHITE} STATUS: {status_str} | Pending Orders: {Fore.MAGENTA}{len(pending_orders)} | Pullback: {ENTRY_PULLBACK_PERCENT}%")
-    print(f"{Fore.CYAN}{'='*190}")
+    # === PUK in LINE STYLE + CUTE CAT (Pulse Effect) ===
+    line_pulse = Fore.CYAN if int(datetime.now().timestamp() * 2) % 2 == 0 else Fore.WHITE
+    print(f"""
+{line_pulse}   ██████╗ ██╗   ██╗██╗  ██╗
+   ██╔══██╗██║   ██║██║ ██╔╝
+   ██████╔╝██║   ██║█████╔╝ 
+   ██╔═══╝ ██║   ██║██╔═██╗ 
+   ██║     ╚██████╔╝██║  ██╗
+   ╚═╝      ╚═════╝ ╚═╝  ╚═╝
+
+             /\\_/\\ 
+            ( o.o ) 
+             > ^ <{Style.RESET_ALL}
+    """)
+
+    # === MAJOR TICKER - REAL-TIME MARQUEE WITH RANDOM REVERSE ===
+    ticker_parts = []
+    for sym in MAJOR_TICKER_SYMBOLS:
+        if sym not in price_map:
+            continue
+        curr_p = price_map[sym]
+        prev_p = prev_prices.get(sym, curr_p)
+        
+        change = curr_p - prev_p
+        change_pct = (change / prev_p * 100) if prev_p > 0 else 0
+        
+        sym_name = sym.replace('USDT', '')
+        if change > 0:
+            arrow = "⬆"
+            color = Fore.GREEN
+        elif change < 0:
+            arrow = "⬇"
+            color = Fore.RED
+        else:
+            arrow = "→"
+            color = Fore.YELLOW
+        
+        part = f"{color}{Style.BRIGHT}{sym_name}{Style.NORMAL} {curr_p:,.4f} {arrow} {change_pct:+.2f}%{Fore.WHITE}   "
+        ticker_parts.append(part)
+        
+        # อัปเดต prev_prices
+        prev_prices[sym] = curr_p
     
+    full_ticker = "   │   ".join(ticker_parts) + "          "  # ช่องว่างเพิ่มเติม
+    ticker_length = len(full_ticker.rstrip())  # ไม่นับช่องว่างท้ายสุด
+    
+    # สุ่มเปลี่ยนทิศทาง 5% โอกาสต่อการ refresh
+    if random.random() < 0.05:
+        ticker_direction *= -1
+    
+    # เลื่อน ticker (เร็วขึ้นนิดหน่อย)
+    ticker_offset = (ticker_offset + ticker_direction * 2) % ticker_length
+    if ticker_offset < 0:
+        ticker_offset += ticker_length
+    
+    scrolling_ticker = full_ticker[ticker_offset:] + full_ticker[:ticker_offset]
+    
+    # พิมพ์ Ticker Bar
+    print(f"{Back.BLACK}{Fore.WHITE}{Style.BRIGHT} " + scrolling_ticker.center(188) + Style.RESET_ALL)
+    print(f"{Back.BLACK}{Fore.CYAN}╔" + "═" * 188 + "╗{Style.RESET_ALL}")
+
+    # --- Header Section ---
+    heartbeat = "❤️" if int(datetime.now().timestamp() * 1.5) % 2 == 0 else "🖤"
+    print(f"{Back.BLACK}║ {mode_str}{Fore.CYAN} TITAN LIMIT SWING v31.3 {Fore.WHITE}│ {Fore.MAGENTA}📊 TOP 50 VOLUME {Fore.WHITE}│ 🕒 {Fore.WHITE}{time_now} {' ':<65}║{Style.RESET_ALL}{Fore.RED}{heartbeat}{Style.RESET_ALL}")
+    print(f"{Back.BLACK}{Fore.CYAN}╠" + "═" * 188 + "╣{Style.RESET_ALL}")
+    
+    # --- Account Info ---
+    balance_str = f"💰 BALANCE: {Fore.YELLOW}{Style.BRIGHT}{balance:,.2f}{Style.NORMAL} USDT"
+    pnl_str = f"📈 TOTAL PNL: {bright_pnl}{pnl_color}{total_pnl:+,.2f}{Style.RESET_ALL} USDT"
+    btc_str = f"₿ BTC PRICE: {Fore.YELLOW}{Style.BRIGHT}{btc_price:,.1f}{Style.NORMAL}"
+    pending_str = f"⏳ PENDING: {Fore.MAGENTA}{len(pending_orders)}"
+    active_str = f"⭐ POSITIONS: {Fore.CYAN}{len(active_positions)}/{MAX_OPEN_POSITIONS}"
+    
+    print(f"{Back.BLACK}║  {balance_str:<40} {pnl_str:<45} {btc_str:<35} {status_str:<25} {active_str}{pending_str.rjust(20)}  ║{Style.RESET_ALL}")
+    print(f"{Back.BLACK}{Fore.CYAN}╚" + "═" * 188 + "╝{Style.RESET_ALL}\n")
+    
+    # --- Active Positions ---
+    print(f"{Fore.CYAN}{Style.BRIGHT}⭐ ACTIVE POSITIONS ({len(active_positions)} / {MAX_OPEN_POSITIONS}){Style.RESET_ALL}")
     if active_positions:
-        print(f"{'ID':<4} {'SYMBOL':<10} {'SIDE':<6} {'ENTRY':<12} {'PRICE':<12} {'PNL':<14} {'ROE%':<8} {'SL':<18} {'TP':<18}")
-        print(f"{Fore.LIGHTBLACK_EX}{'-'*190}")
+        print(f" {Fore.WHITE}{'ID':<4} {'SYMBOL':<12} {'SIDE':<12} {'ENTRY':<12} {'PRICE':<12} {'PNL':<15} {'ROE%':<10} {'SL DIST':<20} {'TP DIST':<20}")
+        print(f" {Fore.LIGHTBLACK_EX}{'─' * 188}")
         
         for i, p in enumerate(active_positions, 1):
-            sl_val = p['sl']
-            tp_val = p['tp']
+            side_icon = "📈 LONG 🟢" if p['side'] == 'LONG' else "📉 SHORT 🔴"
+            side_color = Fore.GREEN if p['side'] == 'LONG' else Fore.RED
+            pc = Fore.GREEN if p['pnl'] >= 0 else Fore.RED
+            roe = (p['pnl'] / p['margin'] * 100) if p['margin'] > 0 else 0.0
+            
             curr_price = p['curr_price']
             
-            # คำนวณ % ระยะทางไป SL
-            if sl_val > 0 and curr_price > 0:
-                if p['side'] == 'LONG':
-                    sl_percent = ((sl_val - curr_price) / curr_price) * 100
-                else:  # SHORT
-                    sl_percent = ((curr_price - sl_val) / curr_price) * 100
-                sl_percent_str = f"{sl_percent:+.2f}%"
-                sl_color = Fore.RED if sl_percent < 0 else Fore.GREEN
-                if abs(sl_percent) < 1.0 and sl_percent < 0:
-                    sl_show = f"{Fore.RED}{Back.YELLOW}{sl_val:.4f} ({sl_percent:+.2f}%) DANGER!{Style.RESET_ALL}"
-                else:
-                    sl_show = f"{sl_val:.4f} ({sl_color}{sl_percent_str}{Fore.LIGHTBLACK_EX})"
+            # SL Distance
+            if p['sl'] > 0 and curr_price > 0:
+                sl_dist = abs(curr_price - p['sl']) / curr_price * 100
+                sl_alert = f"{Back.RED}{Fore.WHITE}{Style.BRIGHT} DANGER! {Style.RESET_ALL}" if sl_dist < 1.5 else ""
+                sl_show = f"{sl_alert}{Fore.WHITE}{p['sl']:.6f} {Fore.RED}↓{sl_dist:.2f}%"
             else:
                 sl_show = f"{Fore.RED}NO SL"
             
-            # คำนวณ % ระยะทางไป TP
-            if tp_val > 0 and curr_price > 0:
-                if p['side'] == 'LONG':
-                    tp_percent = ((tp_val - curr_price) / curr_price) * 100
-                else:  # SHORT
-                    tp_percent = ((curr_price - tp_val) / curr_price) * 100
-                tp_percent_str = f"{tp_percent:+.2f}%"
-                tp_color = Fore.GREEN if abs(tp_percent) <= 1.0 else Fore.LIGHTBLACK_EX
-                tp_show = f"{tp_val:.4f} ({tp_color}{tp_percent_str}{Fore.LIGHTBLACK_EX})"
+            # TP Distance
+            if p['tp'] > 0 and curr_price > 0:
+                tp_dist = abs(p['tp'] - curr_price) / curr_price * 100
+                tp_near = f"{Fore.YELLOW}{Style.BRIGHT}★ {Style.NORMAL}" if tp_dist < 2.0 else ""
+                tp_show = f"{tp_near}{Fore.WHITE}{p['tp']:.6f} {Fore.GREEN}↑{tp_dist:.2f}%"
             else:
                 tp_show = f"{Fore.RED}NO TP"
-            
-            sc_color = Fore.GREEN if p['side']=='LONG' else Fore.RED
-            pc = Fore.GREEN if p['pnl']>=0 else Fore.RED
-            roe = (p['pnl']/p['margin']*100) if p['margin']>0 else 0
-            
-            row = (
-                f"{Fore.YELLOW}{i:<4} "
-                f"{Fore.WHITE}{p['symbol'].replace('USDT',''):<10} "
-                f"{sc_color}{p['side']:<6}{Fore.WHITE} "
-                f"{p['entry']:<12.4f} "
-                f"{Fore.CYAN}{curr_price:<12.4f} "
-                f"{pc}{p['pnl']:<+14.2f}{Fore.WHITE} "
-                f"{pc}{roe:>+8.1f}%{Fore.WHITE} "
-                f"{Fore.LIGHTBLACK_EX}{sl_show:<18} "
-                f"{Fore.LIGHTBLACK_EX}{tp_show:<18} "
-            )
-            print(row)
+
+            print(f" {Fore.YELLOW}{Style.BRIGHT}{i:<4}{Style.NORMAL} "
+                  f"{side_color}{p['symbol'].replace('USDT',''):<12}{Fore.WHITE} "
+                  f"{side_icon:<12} "
+                  f"{Fore.WHITE}{p['entry']:<12.6f} "
+                  f"{Fore.CYAN}{Style.BRIGHT}{curr_price:<12.6f}{Style.NORMAL} "
+                  f"{pc}{p['pnl']:+15.2f} "
+                  f"{pc}{roe:+10.2f}% "
+                  f"{sl_show:<20} "
+                  f"{tp_show:<20}")
     else:
-        print(f"{Fore.LIGHTBLACK_EX}  [No filled positions... Waiting for limits to hit]")
-    
-    print(f"{Fore.CYAN}{'='*190}")
-    
+        print(f" {Fore.LIGHTBLACK_EX}   ⟹ ไม่มีตำแหน่งที่เปิดอยู่ รอ Limit เข้า...{Style.RESET_ALL}")
+
+    # --- Pending Orders ---
+    print(f"\n{Fore.CYAN}{Style.BRIGHT}⏳ PENDING LIMIT ORDERS ({len(pending_orders)}){Style.RESET_ALL}")
     if pending_orders:
-        print(f"{'NO':<4} {'SYMBOL':<10} {'SIDE':<6} {'CURRENT':<12} {'LIMIT':<12} {'DIFF $':<12} {'DIFF %':<10} {'QTY':<12} {'AGE (H)':<10} {'ORDER ID':<15}")
-        print(f"{Fore.LIGHTBLACK_EX}{'-'*190}")
+        print(f" {Fore.WHITE}{'NO':<4} {'SYMBOL':<12} {'SIDE':<12} {'CURRENT':<14} {'LIMIT':<14} {'GAP $':<14} {'GAP %':<12} {'QTY':<12} {'AGE':<12} {'STATUS'}")
+        print(f" {Fore.LIGHTBLACK_EX}{'─' * 188}")
         
-        sorted_pending = sorted(pending_orders, key=lambda x: x['time'])
-        
-        for i, o in enumerate(sorted_pending, 1):
-            sym = o['symbol']
-            current_price = price_map.get(sym, 0.0)
-            limit_price = o['price']
-            side_multiplier = -1 if o['side'] == 'BUY' else 1
-            price_diff = (limit_price - current_price) * side_multiplier
-            percent_diff = (price_diff / current_price * 100) if current_price > 0 else 0.0
-            
-            diff_color = Fore.GREEN if percent_diff > 0 else Fore.RED
-            age_hours = (datetime.now() - o['time']).total_seconds() / 3600
-            age_str = f"{age_hours:.1f}h"
-            if age_hours > LIMIT_ORDER_TIMEOUT_HOURS:
-                age_str = f"{Fore.RED}{age_str} (Old!)"
-            
+        for i, o in enumerate(sorted(pending_orders, key=lambda x: x['time']), 1):
+            sym_no_usdt = o['symbol'].replace('USDT', '')
+            curr_p = price_map.get(o['symbol'], 0.0)
+            side_label = "🟢 BUY " if o['side'] == 'BUY' else "🔴 SELL"
             side_color = Fore.GREEN if o['side'] == 'BUY' else Fore.RED
             
-            row = (
-                f"{Fore.YELLOW}{i:<4} "
-                f"{Fore.WHITE}{sym.replace('USDT',''):<10} "
-                f"{side_color}{o['side']:<6}{Fore.WHITE} "
-                f"{Fore.CYAN}{current_price:<12.4f}{Fore.WHITE} "
-                f"{limit_price:<12.4f} "
-                f"{diff_color}{price_diff:+.4f}{Fore.WHITE:<12} "
-                f"{diff_color}{percent_diff:+.2f}%{Fore.WHITE:<10} "
-                f"{o['qty']:<12.4f} "
-                f"{age_str:<10} "
-                f"{Fore.LIGHTBLACK_EX}{o['orderId']:<15} "
-            )
-            print(row)
+            gap_price = abs(o['price'] - curr_p)
+            gap_pct = (gap_price / curr_p * 100) if curr_p > 0 else 0.0
+            gap_color = Fore.GREEN if gap_pct < 1.0 else Fore.YELLOW if gap_pct < 3.0 else Fore.RED
+            
+            age_h = (datetime.now() - o['time']).total_seconds() / 3600
+            age_str = f"{Fore.RED}{Style.BRIGHT}OLD! {age_h:.1f}h{Style.NORMAL}" if age_h > LIMIT_ORDER_TIMEOUT_HOURS else f"{Fore.WHITE}{age_h:.1f}h"
+            status = f"{Fore.RED}{Style.BRIGHT}⚠️ จะถูกยกเลิก!{Style.NORMAL}" if age_h > LIMIT_ORDER_TIMEOUT_HOURS else ""
+
+            print(f" {Fore.YELLOW}{Style.BRIGHT}{i:<4}{Style.NORMAL} "
+                  f"{Fore.WHITE}{sym_no_usdt:<12} "
+                  f"{side_color}{side_label:<12}{Fore.WHITE} "
+                  f"{Fore.CYAN}{curr_p:<14.6f} "
+                  f"{Fore.YELLOW}{Style.BRIGHT}{o['price']:<14.6f}{Style.NORMAL} "
+                  f"{gap_color}{gap_price:+.6f}{Fore.WHITE:<14} "
+                  f"{gap_color}{gap_pct:+.2f}%{Fore.WHITE:<12} "
+                  f"{Fore.WHITE}{o['qty']:<12.4f} "
+                  f"{age_str:<12} "
+                  f"{status}")
     else:
-        print(f"{Fore.LIGHTBLACK_EX}  [No pending limit orders]")
+        print(f" {Fore.LIGHTBLACK_EX}   ⟹ ไม่มี Limit Order ที่รออยู่...{Style.RESET_ALL}")
 
-    print(f"{Fore.CYAN}{'='*190}")
-    print(f"{Fore.WHITE} Commands: [ID] Close | a Close All | c Cancel All | q Quit | Telegram: /help /report /limits /analyze")
-
+    # --- Footer with Heartbeat ---
+    heartbeat_footer = "❤️" if int(datetime.now().timestamp() * 1.5) % 2 == 0 else "🖤"
+    print(f"\n{Fore.CYAN}╔{'═' * 186}╗")
+    print(f"║ {Fore.WHITE}🎮 COMMANDS: {Fore.YELLOW}{Style.BRIGHT}[ID]{Style.NORMAL}{Fore.WHITE} Close │ "
+          f"{Fore.YELLOW}{Style.BRIGHT}A{Style.NORMAL}{Fore.WHITE} Close All │ "
+          f"{Fore.YELLOW}{Style.BRIGHT}C{Style.NORMAL}{Fore.WHITE} Cancel Limits │ "
+          f"{Fore.RED}{Style.BRIGHT}Q{Style.NORMAL}{Fore.WHITE} Quit │ "
+          f"{Fore.CYAN}📱 Telegram: /help /report /limits {heartbeat_footer.rjust(45)}║")
+    print(f"╚{'═' * 186}╝{Style.RESET_ALL}")
 # ==========================================================================
 #                  ANALYZE TREND (4h timeframe)
 # ==========================================================================
@@ -546,6 +627,7 @@ async def check_telegram_updates(client, cmd_q, price_map):
 # ==========================================================================
 async def main():
     global bal, active, btc_p, pending_orders_detail, running, sym_info, sym_filters, prev_active_symbols
+    global top_50_symbols, last_volume_update
 
     try:
         client = await AsyncClient.create(API_KEY, API_SECRET, testnet=USE_TESTNET)
@@ -556,10 +638,11 @@ async def main():
         
         if telegram_bot:
             greeting = (
-                "🚀 **TITAN PRO v31.2 เริ่มทำงานแล้ว!**\n"
+                "🚀 **TITAN PRO v31.3 เริ่มทำงานแล้ว! (Top 50 Volume)**\n"
                 f"🕒 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
                 f"⚙️ โหมด: {'🧪 TESTNET' if USE_TESTNET else '🔴 LIVE'}\n"
-                f"💰 Balance: {bal:,.2f} USDT\n\n"
+                f"💰 Balance: {bal:,.2f} USDT\n"
+                f"🔥 สแกนจาก Top 50 Volume อัปเดตทุก 4 ชม.\n\n"
                 "📱 ควบคุมผ่าน Telegram ได้เต็มรูปแบบ!\n"
                 "พิมพ์ `/help` เพื่อดูคำสั่ง\n"
                 "_LFG!_ 🚀"
@@ -584,7 +667,7 @@ async def main():
 
     info = await client.futures_exchange_info()
     for s in info['symbols']:
-        if s['symbol'].endswith('USDT') and s['status'] == 'TRADING':
+        if s['symbol'].endswith('USDT') and s['status'] == 'TRADING' and s['contractType'] == 'PERPETUAL':
             sym = s['symbol']
             sym_info[sym] = (s['pricePrecision'], s['quantityPrecision'])
             tick = step = 0.0
@@ -594,6 +677,27 @@ async def main():
                 elif f['filterType'] == 'LOT_SIZE':
                     step = float(f['stepSize'])
             sym_filters[sym] = {'tickSize': tick, 'stepSize': step}
+
+    # ดึง Top 50 Volume ครั้งแรก
+    try:
+        print(f"{Fore.CYAN}Fetching initial Top 50 by 24h Volume...")
+        tickers = await client.futures_ticker()
+        volume_list = []
+        for t in tickers:
+            sym = t['symbol']
+            if sym.endswith('USDT') and sym in sym_info:
+                try:
+                    vol = float(t['quoteVolume'])
+                    volume_list.append((sym, vol))
+                except:
+                    pass
+        volume_list.sort(key=lambda x: x[1], reverse=True)
+        top_50_symbols = [s[0] for s in volume_list[:50]]
+        last_volume_update = datetime.now()
+        print(f"{Fore.GREEN}Loaded {len(top_50_symbols)} Top Volume symbols!")
+        print(f"{Fore.YELLOW}Top 10: {', '.join(top_50_symbols[:10])}")
+    except Exception as e:
+        print(f"{Fore.RED}Failed to load initial Top 50: {e}")
 
     print(f"{Fore.CYAN}System Ready!")
 
@@ -615,7 +719,6 @@ async def main():
                     active_symbols.add(sym)
                     entry = float(p['entryPrice'])
                     
-                    # ดึง SL และ TP จาก open orders
                     orders = await client.futures_get_open_orders(symbol=sym)
                     
                     sl = 0.0
@@ -648,17 +751,12 @@ async def main():
                         'tp': tp
                     })
 
-            # ==========================================================================
-            #           AUTO SET STOP LOSS & TAKE PROFIT WHEN NEW POSITION FILLED
-            # ==========================================================================
+            # AUTO SET SL/TP FOR NEW POSITIONS
             current_active_symbols = {p['symbol'] for p in active}
-            
-            new_positions = [
-                p for p in active
-                if p['symbol'] not in prev_active_symbols and p['sl'] == 0.0
-            ]
+            new_positions = [p for p in active if p['symbol'] not in prev_active_symbols and p['sl'] == 0.0]
             
             for pos in new_positions:
+                # ... (โค้ดตั้ง SL/TP เดิมทั้งหมด ไม่เปลี่ยน)
                 sym = pos['symbol']
                 side = pos['side']
                 entry_price = pos['entry']
@@ -779,6 +877,7 @@ async def main():
                     await send_telegram_report("🛑 บอทหยุดทำงานเรียบร้อย")
                     print(f"{Fore.YELLOW}Shutdown command received. Stopping gracefully...")
                 elif cmd in ['a', 'closeall']:
+                    # ... (โค้ด close all เดิม)
                     for p in active:
                         side = SIDE_SELL if p['side'] == 'LONG' else SIDE_BUY
                         try:
@@ -801,6 +900,7 @@ async def main():
                     print(f"{Fore.RED}All positions closed & all orders cancelled!")
 
                 elif cmd in ['c', 'cancel']:
+                    # ... (โค้ด cancel เดิม)
                     try:
                         open_orders = await client.futures_get_open_orders()
                         limit_orders = [o for o in open_orders if o['type'] == 'LIMIT']
@@ -815,11 +915,32 @@ async def main():
                         await send_telegram_report(f"❌ เกิดข้อผิดพลาดในการยกเลิก: {e}")
                         print(f"{Fore.RED}Cancel error: {e}")
 
+            # อัปเดต Top 50 Volume ทุก 4 ชม.
+            if datetime.now() - last_volume_update > VOLUME_UPDATE_INTERVAL:
+                try:
+                    print(f"{Fore.CYAN}Updating Top 50 Volume...")
+                    tickers = await client.futures_ticker()
+                    volume_list = []
+                    for t in tickers:
+                        sym = t['symbol']
+                        if sym.endswith('USDT') and sym in sym_info:
+                            try:
+                                vol = float(t['quoteVolume'])
+                                volume_list.append((sym, vol))
+                            except:
+                                pass
+                    volume_list.sort(key=lambda x: x[1], reverse=True)
+                    top_50_symbols = [s[0] for s in volume_list[:50]]
+                    last_volume_update = datetime.now()
+                    print(f"{Fore.GREEN}Top 50 Updated! Top 5: {', '.join(top_50_symbols[:5])}")
+                except Exception as e:
+                    print(f"{Fore.RED}Update Top 50 failed: {e}")
+
             total_active_trade_intent = len(active_symbols) + len(pending_symbols)
             free_slots = MAX_OPEN_POSITIONS - total_active_trade_intent
 
             if free_slots > 0 and bal >= MIN_BALANCE_TO_TRADE:
-                potential = [s for s in MAJOR_SYMBOLS if s in sym_info and s not in active_symbols and s not in pending_symbols]
+                potential = [s for s in top_50_symbols if s not in active_symbols and s not in pending_symbols]
                 
                 if potential:
                     batch = random.sample(potential, min(len(potential), SCAN_BATCH_SIZE))
@@ -866,7 +987,7 @@ async def main():
                             print(f"{Fore.YELLOW}⏳ Limit Placed: {r['symbol']} {r['side']} @ {limit_price_str} (Qty: {qty})")
                             
                             await send_telegram_report(
-                                f"⏳ **PENDING LIMIT** #{r['symbol']}\nSide: {r['side']}\nLimit: `{limit_price_str}`\nPullback: {ENTRY_PULLBACK_PERCENT}%\nQty: {qty}")
+                                f"⏳ **PENDING LIMIT** #{r['symbol'].replace('USDT','')}\nSide: {r['side']}\nLimit: `{limit_price_str}`\nPullback: {ENTRY_PULLBACK_PERCENT}%\nQty: {qty}")
 
                             pending_symbols.add(r['symbol'])
                             free_slots -= 1
