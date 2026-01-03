@@ -17,6 +17,9 @@ from telegram import Bot
 from telegram.error import TelegramError
 import matplotlib.pyplot as plt
 import io
+import torch
+import torch.nn as nn
+import torch.optim as optim
 
 # --- LOAD ENV FIRST ---
 load_dotenv()
@@ -33,28 +36,28 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 telegram_bot = None
 update_offset = None
-running = True  # สำหรับ graceful shutdown
-# เรียก init เพื่อให้ colorama ทำงานบน Windows ได้ดี
-init(autoreset=True)
+running = True
 
-# Global variables ที่ต้องประกาศนอกฟังก์ชัน
+# Global variables
 prev_prices = {}
 ticker_offset = 0
-ticker_direction = 1  # 1 = เลื่อนไปทางซ้าย, -1 = เลื่อนไปทางขวา (จะสุ่มเปลี่ยนทิศบางครั้ง)
+ticker_direction = 1
 
-# ตัวแปรสถานะบอท (global เพื่อให้ Telegram เข้าถึงได้)
 bal = 0.0
 active = []
 btc_p = 0.0
 pending_orders_detail = []
 sym_info = {}
 sym_filters = {}
-prev_active_symbols = set()  # <--- เพิ่มสำหรับตรวจจับ Position ใหม่
 
-# เพิ่มตัวแปรสำหรับ Top 50 Volume
 top_50_symbols = []
 last_volume_update = datetime.min
-VOLUME_UPDATE_INTERVAL = timedelta(hours=4)  # อัปเดตทุก 4 ชั่วโมง
+VOLUME_UPDATE_INTERVAL = timedelta(hours=4)
+
+# เก็บ symbol ที่แจ้งคำแนะนำแล้ว (ไม่แจ้งซ้ำ)
+sl_tp_advice_notified = set()
+
+signal_features = {}
 
 if TELEGRAM_BOT_TOKEN:
     try:
@@ -75,43 +78,61 @@ API_SECRET = os.getenv("BINANCE_API_SECRET")
 if not API_KEY or not API_SECRET:
     print(f"{Fore.RED}Error: ไม่พบ API Key ใน .env file!")
     sys.exit(1)
-#False
-USE_TESTNET = True
+#True
+USE_TESTNET = False
 
 MEMORY_FILE = "titan_memory.json"
 
 # ==========================================================================
-#                  OPTIMIZED CONFIG FOR $40 BALANCE
+#                                 CONFIG $1000
 # ==========================================================================
-MAX_LEVERAGE = 20  # ลดเหลือ 30x เพื่อความปลอดภัยกับทุนน้อย (ลด margin ใช้, ลด liquidation risk)
-RISK_PER_TRADE_PERCENT = 0.025  # เสี่ยง 2.5% ต่อไม้ (จากเดิม 2% → เพิ่มนิดเพื่อให้เปิด position ได้ง่ายขึ้น)
+#MAX_LEVERAGE = 20
+#RISK_PER_TRADE_PERCENT = 0.025
+#MAX_OPEN_POSITIONS = 50
+#SIGNAL_THRESHOLD_LONG = 6
+#SIGNAL_THRESHOLD_SHORT = 7
+#ADX_THRESHOLD = 25
+#SCAN_BATCH_SIZE = 60
+#MIN_NOTIONAL_USDT = 5
+#MIN_BALANCE_TO_TRADE = 100.0
 
-MAX_OPEN_POSITIONS = 50
-SIGNAL_THRESHOLD_LONG = 6
-SIGNAL_THRESHOLD_SHORT = 7
-ADX_THRESHOLD = 25
-SCAN_BATCH_SIZE = 60
-MIN_NOTIONAL_USDT = 5
-MIN_BALANCE_TO_TRADE = 100.0  # ต้องมีอย่างน้อย $15 เพื่อเริ่มเทรด (ปลอดภัยกว่า)
+# ปรับตาม Fibonacci: รอ pullback ลึกขึ้น
+#ENTRY_PULLBACK_PERCENT = 10.8
+#LIMIT_ORDER_TIMEOUT_HOURS = 2
 
-# --- LIMIT ENTRY SETTINGS ---
-ENTRY_PULLBACK_PERCENT = 3.8
-LIMIT_ORDER_TIMEOUT_HOURS = 2
+#ATR_SL_MULTIPLIER = 3.0
+#ATR_TP_MULTIPLIER = 6.0
 
-# SL/TP Settings
-ATR_SL_MULTIPLIER = 3.0
-ATR_TP_MULTIPLIER = 6.0  # RR 1:2
+# ==========================================================================
+#                        OPTIMIZED CONFIG FOR $5 CAPITAL
+# ==========================================================================
 
-# ลบ MAJOR_SYMBOLS ออก เพราะใช้ Top 50 Volume แทน
-# สำหรับ Major Ticker
-MAJOR_TICKER_SYMBOLS  = [
+MAX_LEVERAGE = 10                  # ลดจาก 20 → 10x เพื่อความปลอดภัย (ลดความเสี่ยงล้างพอร์ต)
+RISK_PER_TRADE_PERCENT = 0.5       # เพิ่มจาก 0.025 → 0.5% ของพอร์ตต่อไม้ (เหมาะกับทุนน้อย)
+MAX_OPEN_POSITIONS = 3             # ลดจาก 50 → 3 ไม้พร้อมกัน (ป้องกัน over-exposure)
+SIGNAL_THRESHOLD_LONG = 7          # เพิ่มจาก 6 → 7 (สัญญาณต้องแน่นกว่าเดิม)
+SIGNAL_THRESHOLD_SHORT = 8         # เพิ่มจาก 7 → 8 (เข้มงวดกว่า LONG เพราะตลาดลงเร็ว)
+ADX_THRESHOLD = 30                 # เพิ่มจาก 25 → 30 (เทรนด์ต้องแข็งแรงจริงๆ)
+SCAN_BATCH_SIZE = 30               # ลดจาก 60 → 30 (ลดการสแกนหนักเกินไป)
+MIN_NOTIONAL_USDT = 5              # คงไว้ (ขั้นต่ำ Binance Futures)
+MIN_BALANCE_TO_TRADE = 4.0         # ลดจาก 100 → 4 (ให้บอทเริ่มเทรดได้แม้ทุนเหลือน้อย)
+
+# ปรับการเข้าให้รอโซนดีจริง ๆ ตาม Fibonacci
+ENTRY_PULLBACK_PERCENT = 12.0      # เพิ่มจาก 10.8 → 12.0% รอ pullback ลึกขึ้นเพื่อเข้าในจุดที่ดีกว่า
+LIMIT_ORDER_TIMEOUT_HOURS = 4      # เพิ่มจาก 2 → 4 ชม. ให้เวลา Limit รอจับมากขึ้น
+
+# Risk Management ที่สมดุล
+ATR_SL_MULTIPLIER = 2.5            # ลดจาก 3.0 → 2.5 (SL แน่นขึ้น ลดความเสี่ยง)
+ATR_TP_MULTIPLIER = 6.0            # คงไว้ (RR 1:2.4 ยังดีอยู่)
+
+MAJOR_TICKER_SYMBOLS = [
     'BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'XRPUSDT', 'ADAUSDT',
     'DOGEUSDT', 'AVAXUSDT', 'LINKUSDT', 'DOTUSDT', 'TRXUSDT', 'MATICUSDT',
-    'LTCUSDT', 'BCHUSDT', 'NEARUSDT', 'UNIUSDT', 'SUIUSDT', 'APTUSDT']
+    'LTCUSDT', 'BCHUSDT', 'NEARUSDT', 'UNIUSDT', 'SUIUSDT', 'APTUSDT'
+]
 
+prev_prices = {sym: 0.0 for sym in MAJOR_TICKER_SYMBOLS}
 
-prev_prices = {sym: 0.0 for sym in MAJOR_TICKER_SYMBOLS}  # เก็บราคาครั้งก่อนเพื่อหา up/down
-ticker_offset = 0  # สำหรับเอฟเฟกต์ไหล
 # ==========================================================================
 #                   NATIVE INDICATORS
 # ==========================================================================
@@ -165,21 +186,81 @@ def calculate_indicators(kline_data):
 # ==========================================================================
 #                            AI BRAIN
 # ==========================================================================
+class SimpleMLP(nn.Module):
+    def __init__(self, input_size, hidden_size=32):
+        super().__init__()
+        self.fc1 = nn.Linear(input_size, hidden_size)
+        self.fc2 = nn.Linear(hidden_size, 1)
+
+    def forward(self, x):
+        x = torch.relu(self.fc1(x))
+        x = torch.sigmoid(self.fc2(x))
+        return x
+
 class TitanBrain:
     def __init__(self):
-        self.memory = self.load_memory()
-    
+        self.memory_file = "titan_memory.json"
+        self.model_file = "titan_model.pth"
+        self.data = self.load_memory()
+        input_size = len(self.data[0][0]) if self.data else 7  # assume 7 features
+        self.model = SimpleMLP(input_size)
+        if os.path.exists(self.model_file):
+            try:
+                self.model.load_state_dict(torch.load(self.model_file))
+            except:
+                pass
+        self.train_model()  # train if data enough
+
     def load_memory(self):
-        try:
-            if os.path.exists(MEMORY_FILE):
-                with open(MEMORY_FILE, 'r') as f:
-                    return json.load(f)
-        except:
-            pass
-        return {"wins": [], "losses": []}
+        if os.path.exists(self.memory_file):
+            with open(self.memory_file, 'r') as f:
+                data_json = json.load(f)
+                return [(torch.tensor(d['features'], dtype=torch.float32), d['label']) for d in data_json]
+        return []
+
+    def save_memory(self):
+        data_json = [{'features': x.tolist(), 'label': y} for x, y in self.data]
+        with open(self.memory_file, 'w') as f:
+            json.dump(data_json, f)
+        if self.model:
+            torch.save(self.model.state_dict(), self.model_file)
+
+    def update_memory(self, features, is_win):
+        feat_tensor = torch.tensor(features, dtype=torch.float32)
+        label = 1.0 if is_win else 0.0
+        self.data.append((feat_tensor, label))
+        self.save_memory()
+        self.train_model()
+
+    def train_model(self):
+        if len(self.data) < 10:
+            return
+        optimizer = optim.Adam(self.model.parameters(), lr=0.001)
+        loss_fn = nn.BCELoss()
+        epochs = 200
+        batch_size = 8
+        self.model.train()
+        for epoch in range(epochs):
+            np.random.shuffle(self.data)  # shuffle
+            for i in range(0, len(self.data), batch_size):
+                batch = self.data[i:i+batch_size]
+                X_batch = torch.stack([x for x,y in batch])
+                y_batch = torch.tensor([[y] for x,y in batch], dtype=torch.float32)
+                pred = self.model(X_batch)
+                loss = loss_fn(pred, y_batch)
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+        self.save_memory()  # save after train
 
     def get_ai_confidence(self, f):
-        return 50.0
+        if len(self.data) < 10:
+            return 50.0
+        self.model.eval()
+        with torch.no_grad():
+            feat = torch.tensor(f, dtype=torch.float32).unsqueeze(0)
+            prob = self.model(feat).item() * 100
+            return prob
 
 brain = TitanBrain()
 
@@ -223,22 +304,42 @@ async def analyze_matrix(client, symbol):
             if btc_curr['c'] > btc_curr['ema200']:
                 short_score = 0  
 
-        ai_conf = brain.get_ai_confidence({})
+        side = "LONG" if long_score >= SIGNAL_THRESHOLD_LONG else "SHORT" if short_score >= SIGNAL_THRESHOLD_SHORT else None
+        score = long_score if side == "LONG" else short_score
+
+        f = [
+            float(curr['rsi'] / 100),
+            float(curr['adx'] / 100),
+            float((curr['macd'] - curr['signal']) / curr['atr'] if curr['atr'] > 0 else 0),
+            float((curr['c'] - curr['ema200']) / curr['ema200'] if curr['ema200'] > 0 else 0),
+            float(curr['v'] / curr['vol_ma'] if curr['vol_ma'] > 0 else 1),
+            float(score / 8.0),
+            1.0 if side == 'LONG' else 0.0
+        ]
+
+        ai_conf = brain.get_ai_confidence(f)
         atr_val = float(curr['atr'])
         curr_p = float(curr['c'])
 
         if long_score >= SIGNAL_THRESHOLD_LONG and short_score >= SIGNAL_THRESHOLD_SHORT:
             if long_score > short_score:
-                return {"symbol": symbol, "side": "LONG", "score": long_score, "ai": ai_conf, "atr": atr_val, "curr_p": curr_p}
+                side = "LONG"
+                score = long_score
             elif short_score > long_score:
-                return {"symbol": symbol, "side": "SHORT", "score": short_score, "ai": ai_conf, "atr": atr_val, "curr_p": curr_p}
-            return None
+                side = "SHORT"
+                score = short_score
+            else:
+                return None
         elif long_score >= SIGNAL_THRESHOLD_LONG:
-            return {"symbol": symbol, "side": "LONG", "score": long_score, "ai": ai_conf, "atr": atr_val, "curr_p": curr_p}
+            side = "LONG"
+            score = long_score
         elif short_score >= SIGNAL_THRESHOLD_SHORT:
-            return {"symbol": symbol, "side": "SHORT", "score": short_score, "ai": ai_conf, "atr": atr_val, "curr_p": curr_p}
-        
-        return None
+            side = "SHORT"
+            score = short_score
+        else:
+            return None
+
+        return {"symbol": symbol, "side": side, "score": score, "ai": ai_conf, "atr": atr_val, "curr_p": curr_p}
 
     except BinanceAPIException as e:
         if e.code == -1122: pass
@@ -281,30 +382,34 @@ def calculate_position_size(balance, entry_price, atr, symbol, sym_filters, sym_
         return 0.0
 
 # ==========================================================================
-#                     TELEGRAM HELPER
+#                     TELEGRAM HELPER (รองรับส่งรูปภาพ)
 # ==========================================================================
-async def send_telegram_report(text, chat_id=None):
+async def send_telegram_report(text, chat_id=None, photo=None):
     global telegram_bot, TELEGRAM_CHAT_ID
-    if not telegram_bot: return
+    if not telegram_bot: 
+        return
     target = chat_id or TELEGRAM_CHAT_ID
-    if not target: return
+    if not target: 
+        return
     try:
-        await telegram_bot.send_message(chat_id=target, text=text, parse_mode="Markdown")
+        if photo:
+            await telegram_bot.send_photo(chat_id=target, photo=photo, caption=text, parse_mode="Markdown")
+        else:
+            await telegram_bot.send_message(chat_id=target, text=text, parse_mode="Markdown")
     except TelegramError as e:
         print(f"{Fore.RED}Telegram send error: {e}")
 
 # ==========================================================================
-#                           DASHBOARD (อัปเดตเวลาแบบ Real-time + นับถอยหลังสวย)
+#                           DASHBOARD
 # ==========================================================================
 def print_dashboard(balance, active_positions, pending_orders, price_map, btc_price, scanning=False):
     global prev_prices, ticker_offset, ticker_direction
     
     os.system('cls' if os.name == 'nt' else 'clear')
     
-    # --- Calculations ---
     total_pnl = sum(p['pnl'] for p in active_positions)
     pnl_color = Fore.GREEN if total_pnl >= 0 else Fore.RED
-    bright_pnl = Style.BRIGHT if abs(total_pnl) > 100 else Style.NORMAL  # Pulse เมื่อ PNL มาก
+    bright_pnl = Style.BRIGHT if abs(total_pnl) > 100 else Style.NORMAL
     status_spinners = ["│", "/", "−", "\\"]
     spinner_idx = int(datetime.now().timestamp() * 8) % 4
     spinner = status_spinners[spinner_idx]
@@ -312,7 +417,6 @@ def print_dashboard(balance, active_positions, pending_orders, price_map, btc_pr
     mode_str = f"{Back.YELLOW}{Fore.BLACK}{Style.BRIGHT} 🧪 TESTNET {Style.RESET_ALL}" if USE_TESTNET else f"{Back.RED}{Fore.WHITE}{Style.BRIGHT} ⚡ LIVE {Style.RESET_ALL}"
     time_now = datetime.now().strftime('%H:%M:%S')
 
-    # === PUK in LINE STYLE + CUTE CAT (Pulse Effect) ===
     line_pulse = Fore.CYAN if int(datetime.now().timestamp() * 2) % 2 == 0 else Fore.WHITE
     print(f"""
 {line_pulse}   ██████╗ ██╗   ██╗██╗  ██╗
@@ -327,7 +431,6 @@ def print_dashboard(balance, active_positions, pending_orders, price_map, btc_pr
              > ^ <{Style.RESET_ALL}
     """)
 
-    # === MAJOR TICKER - REAL-TIME MARQUEE WITH RANDOM REVERSE ===
     ticker_parts = []
     for sym in MAJOR_TICKER_SYMBOLS:
         if sym not in price_map:
@@ -352,33 +455,27 @@ def print_dashboard(balance, active_positions, pending_orders, price_map, btc_pr
         part = f"{color}{Style.BRIGHT}{sym_name}{Style.NORMAL} {curr_p:,.4f} {arrow} {change_pct:+.2f}%{Fore.WHITE}   "
         ticker_parts.append(part)
         
-        # อัปเดต prev_prices
         prev_prices[sym] = curr_p
     
-    full_ticker = "   │   ".join(ticker_parts) + "          "  # ช่องว่างเพิ่มเติม
-    ticker_length = len(full_ticker.rstrip())  # ไม่นับช่องว่างท้ายสุด
+    full_ticker = "   │   ".join(ticker_parts) + "          "
+    ticker_length = len(full_ticker.rstrip())
     
-    # สุ่มเปลี่ยนทิศทาง 5% โอกาสต่อการ refresh
     if random.random() < 0.05:
         ticker_direction *= -1
     
-    # เลื่อน ticker (เร็วขึ้นนิดหน่อย)
     ticker_offset = (ticker_offset + ticker_direction * 2) % ticker_length
     if ticker_offset < 0:
         ticker_offset += ticker_length
     
     scrolling_ticker = full_ticker[ticker_offset:] + full_ticker[:ticker_offset]
     
-    # พิมพ์ Ticker Bar
     print(f"{Back.BLACK}{Fore.WHITE}{Style.BRIGHT} " + scrolling_ticker.center(188) + Style.RESET_ALL)
     print(f"{Back.BLACK}{Fore.CYAN}╔" + "═" * 188 + "╗{Style.RESET_ALL}")
 
-    # --- Header Section ---
     heartbeat = "❤️" if int(datetime.now().timestamp() * 1.5) % 2 == 0 else "🖤"
     print(f"{Back.BLACK}║ {mode_str}{Fore.CYAN} TITAN LIMIT SWING v31.3 {Fore.WHITE}│ {Fore.MAGENTA}📊 TOP 100 VOLUME {Fore.WHITE}│ 🕒 {Fore.WHITE}{time_now} {' ':<65}║{Style.RESET_ALL}{Fore.RED}{heartbeat}{Style.RESET_ALL}")
     print(f"{Back.BLACK}{Fore.CYAN}╠" + "═" * 188 + "╣{Style.RESET_ALL}")
     
-    # --- Account Info ---
     balance_str = f"💰 BALANCE: {Fore.YELLOW}{Style.BRIGHT}{balance:,.2f}{Style.NORMAL} USDT"
     pnl_str = f"📈 TOTAL PNL: {bright_pnl}{pnl_color}{total_pnl:+,.2f}{Style.RESET_ALL} USDT"
     btc_str = f"₿ BTC PRICE: {Fore.YELLOW}{Style.BRIGHT}{btc_price:,.1f}{Style.NORMAL}"
@@ -388,7 +485,6 @@ def print_dashboard(balance, active_positions, pending_orders, price_map, btc_pr
     print(f"{Back.BLACK}║  {balance_str:<40} {pnl_str:<45} {btc_str:<35} {status_str:<25} {active_str}{pending_str.rjust(20)}  ║{Style.RESET_ALL}")
     print(f"{Back.BLACK}{Fore.CYAN}╚" + "═" * 188 + "╝{Style.RESET_ALL}\n")
     
-    # --- Active Positions ---
     print(f"{Fore.CYAN}{Style.BRIGHT}⭐ ACTIVE POSITIONS ({len(active_positions)} / {MAX_OPEN_POSITIONS}){Style.RESET_ALL}")
     if active_positions:
         print(f" {Fore.WHITE}{'ID':<4} {'SYMBOL':<12} {'SIDE':<12} {'ENTRY':<12} {'PRICE':<12} {'PNL':<15} {'ROE%':<10} {'SL DIST':<20} {'TP DIST':<20}")
@@ -402,7 +498,6 @@ def print_dashboard(balance, active_positions, pending_orders, price_map, btc_pr
             
             curr_price = p['curr_price']
             
-            # SL Distance
             if p['sl'] > 0 and curr_price > 0:
                 sl_dist = abs(curr_price - p['sl']) / curr_price * 100
                 sl_alert = f"{Back.RED}{Fore.WHITE}{Style.BRIGHT} DANGER! {Style.RESET_ALL}" if sl_dist < 1.5 else ""
@@ -410,7 +505,6 @@ def print_dashboard(balance, active_positions, pending_orders, price_map, btc_pr
             else:
                 sl_show = f"{Fore.RED}NO SL"
             
-            # TP Distance
             if p['tp'] > 0 and curr_price > 0:
                 tp_dist = abs(p['tp'] - curr_price) / curr_price * 100
                 tp_near = f"{Fore.YELLOW}{Style.BRIGHT}★ {Style.NORMAL}" if tp_dist < 2.0 else ""
@@ -430,7 +524,6 @@ def print_dashboard(balance, active_positions, pending_orders, price_map, btc_pr
     else:
         print(f" {Fore.LIGHTBLACK_EX}   ⟹ ไม่มีตำแหน่งที่เปิดอยู่ รอ Limit เข้า...{Style.RESET_ALL}")
 
-    # --- Pending Orders ---
     print(f"\n{Fore.CYAN}{Style.BRIGHT}⏳ PENDING LIMIT ORDERS ({len(pending_orders)}){Style.RESET_ALL}")
     if pending_orders:
         print(f" {Fore.WHITE}{'NO':<4} {'SYMBOL':<12} {'SIDE':<12} {'CURRENT':<14} {'LIMIT':<14} {'GAP $':<14} {'GAP %':<12} {'QTY':<12} {'AGE':<12} {'STATUS'}")
@@ -463,7 +556,6 @@ def print_dashboard(balance, active_positions, pending_orders, price_map, btc_pr
     else:
         print(f" {Fore.LIGHTBLACK_EX}   ⟹ ไม่มี Limit Order ที่รออยู่...{Style.RESET_ALL}")
 
-    # --- Footer with Heartbeat ---
     heartbeat_footer = "❤️" if int(datetime.now().timestamp() * 1.5) % 2 == 0 else "🖤"
     print(f"\n{Fore.CYAN}╔{'═' * 186}╗")
     print(f"║ {Fore.WHITE}🎮 COMMANDS: {Fore.YELLOW}{Style.BRIGHT}[ID]{Style.NORMAL}{Fore.WHITE} Close │ "
@@ -472,50 +564,6 @@ def print_dashboard(balance, active_positions, pending_orders, price_map, btc_pr
           f"{Fore.RED}{Style.BRIGHT}Q{Style.NORMAL}{Fore.WHITE} Quit │ "
           f"{Fore.CYAN}📱 Telegram: /help /report /limits {heartbeat_footer.rjust(45)}║")
     print(f"╚{'═' * 186}╝{Style.RESET_ALL}")
-
-# ==========================================================================
-#                  ANALYZE TREND (4h timeframe)
-# ==========================================================================
-async def analyze_trend(client, symbol):
-    try:
-        k = await client.futures_klines(symbol=symbol, interval="4h", limit=200)
-        if not k: return "ไม่พบข้อมูลสำหรับเหรียญนี้"
-        
-        df = calculate_indicators(k)
-        if df.empty: return "ไม่สามารถคำนวณ indicators ได้"
-        
-        curr = df.iloc[-1]
-        
-        trend_summary = f"**วิเคราะห์แนวโน้ม {symbol.replace('USDT','')} (4h)**\n"
-        trend_summary += f"ราคาปัจจุบัน: {float(curr['c']):,.4f} USDT\n"
-        trend_summary += f"ADX: {curr['adx']:.1f} → {'แข็งแรง' if curr['adx'] > 30 else 'อ่อน'}\n"
-        trend_summary += f"RSI: {curr['rsi']:.1f} → {'Overbought' if curr['rsi'] > 70 else 'Oversold' if curr['rsi'] < 30 else 'ปกติ'}\n"
-        trend_summary += f"MACD {'Bullish 📈' if curr['macd'] > curr['signal'] else 'Bearish 📉'}\n"
-        trend_summary += f"EMA: {'ขาขึ้น 🟢' if curr['ema20'] > curr['ema50'] > curr['ema200'] else 'ขาลง 🔴' if curr['ema20'] < curr['ema50'] < curr['ema200'] else 'ไซด์เวย์ 🟡'}\n"
-        trend_summary += f"BB: {'ทะลุบน (Breakout)' if curr['c'] > curr['bb_upper'] else 'ทะลุล่าง (Oversold)' if curr['c'] < curr['bb_lower'] else 'กลาง (Range)'}\n"
-        trend_summary += f"\n**สรุป**: {'🟢 แนวโน้มขาขึ้นแข็งแรง' if curr['adx'] > 30 and curr['macd'] > curr['signal'] and curr['ema20'] > curr['ema50'] else '🔴 แนวโน้มขาลงแข็งแรง' if curr['adx'] > 30 and curr['macd'] < curr['signal'] and curr['ema20'] < curr['ema50'] else '🟡 ไซด์เวย์ / อ่อน'}"
-        
-        return trend_summary
-    except Exception as e:
-        return f"เกิดข้อผิดพลาด: {e}"
-
-# ==========================================================================
-#                  PENDING LIMITS REPORT
-# ==========================================================================
-def get_pending_limits_report(pending_orders, price_map):
-    if not pending_orders:
-        return "⏳ ไม่มี Limit Orders ที่รออยู่"
-    
-    lines = ["**⏳ Pending Limit Orders ทั้งหมด**"]
-    for o in sorted(pending_orders, key=lambda x: x['time']):
-        sym = o['symbol'].replace('USDT', '')
-        curr = price_map.get(o['symbol'], 0.0)
-        diff = o['price'] - curr if o['side'] == 'BUY' else curr - o['price']
-        pct = (diff / curr * 100) if curr > 0 else 0
-        age = (datetime.now() - o['time']).total_seconds() / 3600
-        lines.append(f"• {sym} {o['side']} @ {o['price']:.4f} (ตอนนี้ {curr:.4f})")
-        lines.append(f"  ห่าง: {diff:+.4f} ({pct:+.2f}%) | จำนวน: {o['qty']:.4f} | อายุ: {age:.1f}ชั่วโมง")
-    return "\n".join(lines)
 
 # ==========================================================================
 #                  CANCEL OLD LIMITS
@@ -541,7 +589,7 @@ async def cancel_old_pending_limits(client):
         print(f"{Fore.RED}Error cleaning old limits: {e}")
 
 # ==========================================================================
-#                  TELEGRAM COMMAND LISTENER
+#                  TELEGRAM COMMAND LISTENER (รวม /analyze + กราฟ Fibonacci สวยงาม)
 # ==========================================================================
 async def check_telegram_updates(client, cmd_q, price_map):
     global update_offset, running, bal, active, btc_p, pending_orders_detail
@@ -569,7 +617,7 @@ async def check_telegram_updates(client, cmd_q, price_map):
                     "💰 ดูราคา → พิมพ์ `BTC`, `ETH`, `SOL`\n"
                     "📊 `/report` หรือ `/status` → สถานะเต็ม\n"
                     "⏳ `/limits` → รายการ Limit Orders ทั้งหมด\n"
-                    "🔍 `/analyze BTC` → วิเคราะห์แนวโน้ม 4h\n"
+                    "🔍 `/analyze BTC` → วิเคราะห์ + กราฟ Fibonacci 4h (สวยงาม)\n"
                     "🛠 `/cancel` → ยกเลิก Limit ทั้งหมด\n"
                     "🛑 `/closeall` → ปิดทุก Position\n"
                     "🚪 `/q` → หยุดบอท\n\n"
@@ -608,87 +656,87 @@ async def check_telegram_updates(client, cmd_q, price_map):
 
             elif text.startswith('/analyze '):
                 try:
-                    sym = text.split(' ', 1)[1].upper() + 'USDT'
-                    analysis = await analyze_trend(client, sym)
-                    await send_telegram_report(analysis, chat_id)
-                except:
-                    await send_telegram_report("❌ ใช้งาน: `/analyze BTC`", chat_id)
+                    sym_input = text.split(' ', 1)[1].upper()
+                    sym = sym_input + 'USDT'
+                    current_price = price_map.get(sym, 0.0)
+                    if current_price == 0.0:
+                        await send_telegram_report("❓ ไม่พบเหรียญนี้หรือราคา", chat_id)
+                        continue
 
-            else:
-                sym_input = text.upper()
-                sym = sym_input + "USDT"
-                if sym in price_map:
-                    current_price = price_map[sym]
-
-                    # ดึง klines 4h
                     k = await client.futures_klines(symbol=sym, interval="4h", limit=100)
                     df = pd.DataFrame(k, columns=['ts', 'o', 'h', 'l', 'c', 'v', 'ct', 'qv', 'nt', 'tb', 'tq', 'i']).astype(float)
-                    df['ts'] = pd.to_datetime(df['ts'], unit='ms')
 
-                    # คำนวณ Fibonacci levels (ใช้ high/low ในช่วง 100 candles 4h ~16 วัน)
                     high = df['h'].max()
                     low = df['l'].min()
                     diff = high - low
+
                     fib_levels = {
-                        '0% (High)': high,
+                        '0.0% (High)': high,
                         '23.6%': high - 0.236 * diff,
                         '38.2%': high - 0.382 * diff,
-                        '50%': high - 0.5 * diff,
+                        '50.0%': high - 0.5 * diff,
                         '61.8%': high - 0.618 * diff,
                         '78.6%': high - 0.786 * diff,
                         '100% (Low)': low
                     }
 
-                    # คำนวณแนวรับแนวต้านจาก Pivot Point (ใช้ last candle)
-                    last_high = df['h'].iloc[-1]
-                    last_low = df['l'].iloc[-1]
-                    last_close = df['c'].iloc[-1]
-                    pivot = (last_high + last_low + last_close) / 3
-                    support1 = 2 * pivot - last_high
-                    resistance1 = 2 * pivot - last_low
-                    support2 = pivot - (last_high - last_low)
-                    resistance2 = pivot + (last_high - last_low)
+                    # กราฟ Fibonacci สวยงามมาก
+                    plt.style.use('dark_background')
+                    fig, ax = plt.subplots(figsize=(16, 9), dpi=150)
+                    fig.patch.set_facecolor('#121212')
+                    ax.set_facecolor('#121212')
 
-                    # สร้างกราฟ line chart (simple)
-                    fig, ax = plt.subplots(figsize=(10, 6))
-                    ax.plot(df['ts'], df['c'], label='Close Price', color='blue')
+                    ax.plot(df.index, df['c'], label='ราคาปิด (Close)', color='#00ffea', linewidth=3, alpha=0.9)
 
-                    # เพิ่มเส้น Fibo dashed lines
-                    for label, level in fib_levels.items():
-                        ax.axhline(y=level, color='red', linestyle='--', label=f'{label}: {level:.6f}')
+                    fib_colors = ['#ff1744', '#ff9100', '#ffd600', '#00e676', '#00e5ff', '#7c4dff', '#e0e0e0']
+                    fib_labels = ['0.0% (High)', '23.6%', '38.2%', '50.0%', '61.8%', '78.6%', '100% (Low)']
+                    for i, (label, level) in enumerate(fib_levels.items()):
+                        ax.axhline(level, color=fib_colors[i], linestyle='--', linewidth=2.5, alpha=0.85)
+                        ax.text(len(df)-1, level, f' {label}: {level:.6f} ', color=fib_colors[i], va='center', ha='right',
+                                fontsize=11, bbox=dict(boxstyle="round,pad=0.5", facecolor='#121212', edgecolor=fib_colors[i], alpha=0.8))
 
-                    # เพิ่มแนวรับแนวต้าน
-                    ax.axhline(y=support1, color='green', linestyle='-', label=f'S1: {support1:.6f}')
-                    ax.axhline(y=resistance1, color='orange', linestyle='-', label=f'R1: {resistance1:.6f}')
-                    ax.axhline(y=support2, color='darkgreen', linestyle='-', label=f'S2: {support2:.6f}')
-                    ax.axhline(y=resistance2, color='darkorange', linestyle='-', label=f'R2: {resistance2:.6f}')
+                    ax.set_title(f'{sym_input} 4h Chart - Fibonacci Retracement', color='white', fontsize=20, pad=20)
+                    ax.set_xlabel('แท่งเทียน (Candles)', color='white', fontsize=14)
+                    ax.set_ylabel('ราคา (USDT)', color='white', fontsize=14)
+                    ax.tick_params(colors='white', labelsize=10)
+                    ax.grid(True, alpha=0.3, color='#424242', linestyle='-', linewidth=0.5)
+                    ax.legend(facecolor='#121212', labelcolor='white', fontsize=12, loc='upper left')
 
-                    ax.legend(loc='upper left', bbox_to_anchor=(1, 1))
-                    ax.set_title(f"{sym_input} 4h Chart with Fibonacci & S/R Levels")
-                    ax.set_xlabel('Time')
-                    ax.set_ylabel('Price')
                     plt.tight_layout()
 
-                    # บันทึกกราฟเป็น bytes
                     buf = io.BytesIO()
-                    fig.savefig(buf, format='png')
+                    fig.savefig(buf, format='png', bbox_inches='tight', facecolor=fig.get_facecolor(), edgecolor='none')
                     buf.seek(0)
-
-                    # ส่งข้อความราคา + Fibo + S/R
-                    report = f"💰 **{sym_input}**\nราคาปัจจุบัน: {current_price:,.6f} USDT\n\n**Fibonacci Levels (จาก High/Low 4h ล่าสุด):**"
-                    for label, level in fib_levels.items():
-                        report += f"\n{label}: {level:.6f}"
-
-                    report += f"\n\n**แนวรับ/แนวต้าน (Pivot Point 4h ล่าสุด):**\nS1: {support1:.6f}\nS2: {support2:.6f}\nR1: {resistance1:.6f}\nR2: {resistance2:.6f}"
-
-                    await telegram_bot.send_message(chat_id=chat_id, text=report, parse_mode="Markdown")
-
-                    # ส่งรูปกราฟ
-                    await telegram_bot.send_photo(chat_id=chat_id, photo=buf)
-
-                    buf.close()
+                    photo = buf
                     plt.close(fig)
 
+                    now_str = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+                    report_text = (
+                        f"📊 **วิเคราะห์ {sym_input} (4h)**\n"
+                        f"ตรวจสอบเมื่อ: `{now_str}`\n"
+                        f"ราคาปัจจุบัน: `{current_price:.6f}` USDT\n\n"
+                        f"**Fibonacci Retracement Levels**\n"
+                    )
+                    for label, level in fib_levels.items():
+                        report_text += f"• {label}: `{level:.6f}`\n"
+
+                    report_text += (
+                        f"\n**คำแนะนำการเทรด**\n"
+                        f"หากราคาอยู่เหนือ 61.8% → แนวโน้มขาขึ้น แนะนำ LONG\n"
+                        f"หากราคาอยู่ต่ำกว่า 38.2% → แนวโน้มขาลง แนะนำ SHORT\n"
+                        f"รอ pullback ไปยังระดับ Fib ที่สำคัญก่อนเข้า"
+                    )
+
+                    await send_telegram_report(report_text, chat_id, photo=photo)
+
+                except Exception as e:
+                    await send_telegram_report(f"❌ เกิดข้อผิดพลาดในการวิเคราะห์: {str(e)}", chat_id)
+
+            else:
+                sym_input = text.upper()
+                sym = sym_input + "USDT"
+                if sym in price_map:
+                    await send_telegram_report(f"💰 **{sym_input}**\nราคา: {price_map[sym]:,.6f} USDT", chat_id)
                 else:
                     await send_telegram_report("❓ ไม่พบเหรียญนี้", chat_id)
 
@@ -696,11 +744,55 @@ async def check_telegram_updates(client, cmd_q, price_map):
         print(f"{Fore.RED}Telegram polling error: {e}")
 
 # ==========================================================================
+#                  PENDING LIMITS REPORT
+# ==========================================================================
+def get_pending_limits_report(pending_orders, price_map):
+    if not pending_orders:
+        return "⏳ ไม่มี Limit Orders ที่รออยู่"
+    
+    lines = ["**⏳ Pending Limit Orders ทั้งหมด**"]
+    for o in sorted(pending_orders, key=lambda x: x['time']):
+        sym = o['symbol'].replace('USDT', '')
+        curr = price_map.get(o['symbol'], 0.0)
+        diff = o['price'] - curr if o['side'] == 'BUY' else curr - o['price']
+        pct = (diff / curr * 100) if curr > 0 else 0
+        age = (datetime.now() - o['time']).total_seconds() / 3600
+        lines.append(f"• {sym} {o['side']} @ {o['price']:.4f} (ตอนนี้ {curr:.4f})")
+        lines.append(f"  ห่าง: {diff:+.4f} ({pct:+.2f}%) | จำนวน: {o['qty']:.4f} | อายุ: {age:.1f}ชั่วโมง")
+    return "\n".join(lines)
+
+# ==========================================================================
+#                  ANALYZE TREND
+# ==========================================================================
+async def analyze_trend(client, symbol):
+    try:
+        k = await client.futures_klines(symbol=symbol, interval="4h", limit=200)
+        if not k: return "ไม่พบข้อมูลสำหรับเหรียญนี้"
+        
+        df = calculate_indicators(k)
+        if df.empty: return "ไม่สามารถคำนวณ indicators ได้"
+        
+        curr = df.iloc[-1]
+        
+        trend_summary = f"**วิเคราะห์แนวโน้ม {symbol.replace('USDT','')} (4h)**\n"
+        trend_summary += f"ราคาปัจจุบัน: {float(curr['c']):,.4f} USDT\n"
+        trend_summary += f"ADX: {curr['adx']:.1f} → {'แข็งแรง' if curr['adx'] > 30 else 'อ่อน'}\n"
+        trend_summary += f"RSI: {curr['rsi']:.1f} → {'Overbought' if curr['rsi'] > 70 else 'Oversold' if curr['rsi'] < 30 else 'ปกติ'}\n"
+        trend_summary += f"MACD {'Bullish 📈' if curr['macd'] > curr['signal'] else 'Bearish 📉'}\n"
+        trend_summary += f"EMA: {'ขาขึ้น 🟢' if curr['ema20'] > curr['ema50'] > curr['ema200'] else 'ขาลง 🔴' if curr['ema20'] < curr['ema50'] < curr['ema200'] else 'ไซด์เวย์ 🟡'}\n"
+        trend_summary += f"BB: {'ทะลุบน (Breakout)' if curr['c'] > curr['bb_upper'] else 'ทะลุล่าง (Oversold)' if curr['c'] < curr['bb_lower'] else 'กลาง (Range)'}\n"
+        trend_summary += f"\n**สรุป**: {'🟢 แนวโน้มขาขึ้นแข็งแรง' if curr['adx'] > 30 and curr['macd'] > curr['signal'] and curr['ema20'] > curr['ema50'] else '🔴 แนวโน้มขาลงแข็งแรง' if curr['adx'] > 30 and curr['macd'] < curr['signal'] and curr['ema20'] < curr['ema50'] else '🟡 ไซด์เวย์ / อ่อน'}"
+        
+        return trend_summary
+    except Exception as e:
+        return f"เกิดข้อผิดพลาด: {e}"
+
+# ==========================================================================
 #                               MAIN
 # ==========================================================================
 async def main():
-    global bal, active, btc_p, pending_orders_detail, running, sym_info, sym_filters
-    global top_50_symbols, last_volume_update
+    global bal, active, btc_p, pending_orders_detail, running, sym_info, sym_filters, top_50_symbols, last_volume_update
+    global sl_tp_advice_notified, signal_features
 
     try:
         client = await AsyncClient.create(API_KEY, API_SECRET, testnet=USE_TESTNET)
@@ -751,7 +843,6 @@ async def main():
                     step = float(f['stepSize'])
             sym_filters[sym] = {'tickSize': tick, 'stepSize': step}
 
-    # ดึง Top 50 Volume ครั้งแรก
     try:
         print(f"{Fore.CYAN}Fetching initial Top 100 by 24h Volume...")
         tickers = await client.futures_ticker()
@@ -774,6 +865,8 @@ async def main():
 
     print(f"{Fore.CYAN}System Ready!")
 
+    prev_active_symbols = set()
+
     while running:
         try:
             acc = await client.futures_account()
@@ -783,6 +876,7 @@ async def main():
             price_map = {t['symbol']: float(t['price']) for t in all_tickers}
             btc_p = price_map.get("BTCUSDT", 0.0)
             
+            current_active_symbols = set()
             active = []
             active_symbols = set()
             for p in pos_data:
@@ -790,27 +884,25 @@ async def main():
                 if amt != 0:
                     sym = p['symbol']
                     active_symbols.add(sym)
+                    current_active_symbols.add(sym)
                     entry = float(p['entryPrice'])
                     
                     orders = await client.futures_get_open_orders(symbol=sym)
                     
                     sl = 0.0
+                    tp = 0.0
                     for o in orders:
-                        if o['type'] == 'STOP_MARKET' and o.get('closePosition', False):
+                        if o['type'] == 'STOP_MARKET' and (o.get('reduceOnly', False) or o.get('closePosition', False)):
                             try:
                                 sl = float(o['stopPrice'])
                                 break
-                            except:
-                                pass
-                    
-                    tp = 0.0
+                            except: pass
                     for o in orders:
-                        if o['type'] == 'TAKE_PROFIT_MARKET' and o.get('closePosition', False):
+                        if o['type'] == 'TAKE_PROFIT_MARKET' and (o.get('reduceOnly', False) or o.get('closePosition', False)):
                             try:
                                 tp = float(o['stopPrice'])
                                 break
-                            except:
-                                pass
+                            except: pass
                     
                     active.append({
                         'symbol': sym,
@@ -824,133 +916,156 @@ async def main():
                         'tp': tp
                     })
 
-            # === ตั้ง SL/TP อัตโนมัติให้ทุก Position ที่ยังไม่มี SL หรือ TP (ทั้งใหม่และเก่า) ===
-            positions_needing_protection = [
-                p for p in active 
-                if p['sl'] == 0.0 or p['tp'] == 0.0  # ยังไม่มี SL หรือไม่มี TP
-            ]
+            new_positions = current_active_symbols - prev_active_symbols
+            closed_positions = prev_active_symbols - current_active_symbols
 
-            if positions_needing_protection:
-                print(f"{Fore.CYAN}🛡️ พบ {len(positions_needing_protection)} Position ที่ยังไม่มี SL/TP → กำลังตั้งอัตโนมัติ...")
-            for pos in positions_needing_protection:
-                sym = pos['symbol']
+            for sym in closed_positions:
+                f = signal_features.pop(sym, None)
+                if f is not None:
+                    try:
+                        trades = await client.futures_account_trades(symbol=sym, limit=20)
+                        # Find the last trade with realized PNL != 0 (close trade)
+                        close_trades = [t for t in trades if float(t['realizedPnl']) != 0]
+                        if close_trades:
+                            pnl = float(close_trades[-1]['realizedPnl'])
+                            is_win = pnl > 0
+                            brain.update_memory(f, is_win)
+                            print(f"{Fore.CYAN}AI Updated: {sym} {'Win' if is_win else 'Loss'} PNL {pnl}")
+                            await send_telegram_report(f"🧠 AI Memory Updated\n{sym}: {'✅ Win' if is_win else '❌ Loss'}\nPNL: {pnl:.2f} USDT")
+                    except Exception as e:
+                        print(f"{Fore.RED}Error updating AI for {sym}: {e}")
+
+            for sym in new_positions:
+                pos = next(p for p in active if p['symbol'] == sym)
                 side = pos['side']
                 entry_price = pos['entry']
+                current_price = pos['curr_price']
                 qty = abs(pos['amt'])
 
-                # ข้ามถ้ามีทั้ง SL และ TP แล้ว
-                if pos['sl'] > 0 and pos['tp'] > 0:
-                    continue
-
-                print(f"{Fore.CYAN}→ กำลังตั้ง SL/TP ให้ {sym} {side} (Entry: {entry_price:.6f})")
+                print(f"{Fore.CYAN}→ พบ Position ใหม่: {sym} {side} → ตั้ง SL/TP + แจ้งคำแนะนำ")
 
                 try:
-                    klines = await client.futures_klines(symbol=sym, interval="15m", limit=100)
+                    klines = await client.futures_klines(symbol=sym, interval="15m", limit=250)
                     df = calculate_indicators(klines)
-                    if df.empty or len(df) < 50:
-                        print(f"{Fore.YELLOW}ข้อมูลไม่พอสำหรับ {sym} → ข้ามการตั้ง SL/TP")
-                        continue
+                    if df.empty or len(df) < 30:
+                        atr_val = entry_price * 0.02
+                        long_score = 0
+                        short_score = 0
+                        curr = df.iloc[-1] if not df.empty else {'rsi':50, 'adx':25, 'macd':0, 'signal':0, 'atr':atr_val, 'c':current_price, 'ema200':current_price, 'v':1, 'vol_ma':1}
+                    else:
+                        atr_val = float(df.iloc[-1]['atr'])
+                        curr = df.iloc[-1]
+                        long_score = 0
+                        if curr['c'] > curr['ema200']: long_score += 1
+                        if curr['ema20'] > curr['ema50']: long_score += 1
+                        if curr['rsi'] > 50: long_score += 1
+                        if curr['macd'] > curr['signal']: long_score += 1
+                        if curr['c'] > curr['bb_upper']: long_score += 1
+                        if curr['v'] > curr['vol_ma']: long_score += 1
+                        if curr['c'] > curr['o']: long_score += 1
+                        if curr['adx'] > ADX_THRESHOLD: long_score += 1
 
-                    atr_val = float(df.iloc[-1]['atr'])
-                    if atr_val <= 0:
-                        print(f"{Fore.YELLOW}ATR = 0 สำหรับ {sym} → ข้าม")
-                        continue
+                        short_score = 0
+                        if curr['c'] < curr['ema200']: short_score += 1
+                        if curr['ema20'] < curr['ema50']: short_score += 1
+                        if curr['rsi'] < 50: short_score += 1
+                        if curr['macd'] < curr['signal']: short_score += 1
+                        if curr['c'] < curr['bb_lower']: short_score += 1
+                        if curr['v'] > curr['vol_ma']: short_score += 1
+                        if curr['c'] < curr['o']: short_score += 1
+                        if curr['adx'] > ADX_THRESHOLD: short_score += 1
 
-                except Exception as e:
-                    print(f"{Fore.RED}ดึง ATR ล้มเหลว {sym}: {e}")
-                    continue
+                except:
+                    atr_val = entry_price * 0.02
 
-                # คำนวณ SL และ TP
                 if side == 'LONG':
                     sl_price_raw = entry_price - (atr_val * ATR_SL_MULTIPLIER)
                     tp_price_raw = entry_price + (atr_val * ATR_TP_MULTIPLIER)
-                    sl_side = SIDE_SELL
-                    tp_side = SIDE_SELL
-                else:  # SHORT
+                else:
                     sl_price_raw = entry_price + (atr_val * ATR_SL_MULTIPLIER)
                     tp_price_raw = entry_price - (atr_val * ATR_TP_MULTIPLIER)
-                    sl_side = SIDE_BUY
-                    tp_side = SIDE_BUY
 
                 tick_size = sym_filters.get(sym, {}).get('tickSize', 0.0001)
+                step_size = sym_filters.get(sym, {}).get('stepSize', 0.001)
+
                 sl_price = round_to_tick(sl_price_raw, tick_size)
                 tp_price = round_to_tick(tp_price_raw, tick_size)
 
-                if sl_price <= 0 or tp_price <= 0:
-                    print(f"{Fore.RED}ราคา SL/TP ไม่ถูกต้อง → ข้าม {sym}")
-                    continue
+                qty = math.floor(qty / step_size) * step_size if step_size > 0 else qty
+                qty_precision = sym_info.get(sym, (4, 2))[1]
+                qty_str = f"{qty:.{qty_precision}f}"
 
                 price_precision = sym_info.get(sym, (4, 2))[0]
                 sl_price_str = f"{sl_price:.{price_precision}f}"
                 tp_price_str = f"{tp_price:.{price_precision}f}"
+                current_price_str = f"{current_price:.{price_precision}f}"
 
-                success_sl = pos['sl'] > 0  # ถ้ามีอยู่แล้ว = True
-                success_tp = pos['tp'] > 0
-
-                # ตั้ง SL เฉพาะเมื่อยังไม่มี
-                if not success_sl:
-                    try:
-                        await client.futures_create_order(
-                            symbol=sym,
-                            side=sl_side,
-                            type='STOP_MARKET',
-                            stopPrice=sl_price_str,
-                            closePosition=True,
-                            timeInForce=TIME_IN_FORCE_GTC
-                        )
-                        success_sl = True
-                        pos['sl'] = sl_price
-                        print(f"{Fore.GREEN}✅ ตั้ง SL สำเร็จ: {sym} @ {sl_price_str}")
-                    except BinanceAPIException as e:
-                        if "Order would immediately trigger" in str(e):
-                            print(f"{Fore.RED}⚠️ SL ใกล้เกินไป จะทริกเกอร์ทันที → ข้าม SL {sym}")
-                        else:
-                            print(f"{Fore.RED}ตั้ง SL ล้มเหลว {sym}: {e}")
-                    except Exception as e:
-                        print(f"{Fore.RED}ตั้ง SL ล้มเหลว {sym}: {e}")
-
-                # ตั้ง TP เฉพาะเมื่อยังไม่มี
-                if not success_tp:
-                    try:
-                        await client.futures_create_order(
-                            symbol=sym,
-                            side=tp_side,
-                            type='TAKE_PROFIT_MARKET',
-                            stopPrice=tp_price_str,
-                            closePosition=True,
-                            timeInForce=TIME_IN_FORCE_GTC
-                        )
-                        success_tp = True
-                        pos['tp'] = tp_price
-                        print(f"{Fore.GREEN}✅ ตั้ง TP สำเร็จ: {sym} @ {tp_price_str}")
-                    except BinanceAPIException as e:
-                        if "Order would immediately trigger" in str(e):
-                            print(f"{Fore.YELLOW}⚠️ TP ถึงเป้าแล้วหรือใกล้เกินไป → ข้าม TP {sym}")
-                        else:
-                            print(f"{Fore.RED}ตั้ง TP ล้มเหลว {sym}: {e}")
-                    except Exception as e:
-                        print(f"{Fore.RED}ตั้ง TP ล้มเหลว {sym}: {e}")
-
-                # ส่งแจ้งเตือน Telegram ถ้าตั้งสำเร็จอย่างน้อยหนึ่งอย่าง
-                if success_sl or success_tp:
-                    rr_ratio = f"1:{ATR_TP_MULTIPLIER / ATR_SL_MULTIPLIER:.1f}"
-                    status = "🟢 ปกป้องแล้ว" if (success_sl and success_tp) else "🟡 ปกป้องบางส่วน"
-                    report = (
-                        f"{status} **ตั้ง SL/TP อัตโนมัติ**\n"
-                        f"เหรียญ: `{sym.replace('USDT', '')}`\n"
-                        f"ทิศ: **{side}**\n"
-                        f"Entry: `{entry_price:.6f}`\n"
-                        f"{'SL: `' + sl_price_str + '`' if success_sl else 'SL: ไม่มี/ล้มเหลว'}\n"
-                        f"{'TP: `' + tp_price_str + '` (RR 1:2)' if success_tp else 'TP: ไม่มี/ล้มเหลว'}\n"
-                        f"ATR × {ATR_SL_MULTIPLIER}/{ATR_TP_MULTIPLIER} → RR {rr_ratio}\n"
-                        f"จำนวน: `{qty:.4f}`"
+                try:
+                    await client.futures_create_order(
+                        symbol=sym,
+                        side=SIDE_SELL if side == 'LONG' else SIDE_BUY,
+                        type='STOP_MARKET',
+                        quantity=qty_str,
+                        stopPrice=sl_price_str,
+                        reduceOnly=True,
+                        timeInForce=TIME_IN_FORCE_GTC,
+                        workingType='MARK_PRICE'
                     )
-                    await send_telegram_report(report)
-                else:
-                    await send_telegram_report(
-                        f"⚠️ **ไม่สามารถตั้ง SL/TP ได้** สำหรับ `{sym.replace('USDT', '')}` {side}\n"
-                        f"กรุณาตรวจสอบและตั้งด้วยตนเอง!"
+                    pos['sl'] = sl_price
+                except Exception as e:
+                    print(f"{Fore.RED}ตั้ง SL ล้มเหลว {sym}: {e}")
+
+                try:
+                    await client.futures_create_order(
+                        symbol=sym,
+                        side=SIDE_SELL if side == 'LONG' else SIDE_BUY,
+                        type='TAKE_PROFIT_MARKET',
+                        quantity=qty_str,
+                        stopPrice=tp_price_str,
+                        reduceOnly=True,
+                        timeInForce=TIME_IN_FORCE_GTC,
+                        workingType='MARK_PRICE'
                     )
+                    pos['tp'] = tp_price
+                except Exception as e:
+                    print(f"{Fore.RED}ตั้ง TP ล้มเหลว {sym}: {e}")
+
+                score = long_score if side == 'LONG' else short_score
+                f = [
+                    float(curr['rsi'] / 100),
+                    float(curr['adx'] / 100),
+                    float((curr['macd'] - curr['signal']) / curr['atr'] if curr['atr'] > 0 else 0),
+                    float((curr['c'] - curr['ema200']) / curr['ema200'] if curr['ema200'] > 0 else 0),
+                    float(curr['v'] / curr['vol_ma'] if curr['vol_ma'] > 0 else 1),
+                    float(score / 8.0),
+                    1.0 if side == 'LONG' else 0.0
+                ]
+                signal_features[sym] = f
+
+                now_str = datetime.now().strftime("%d/%m/%Y | %H:%M:%S")
+                profit_10 = entry_price * 1.10 if side == 'LONG' else entry_price * 0.90
+                profit_20 = entry_price * 1.20 if side == 'LONG' else entry_price * 0.80
+                sl_wide_raw = entry_price - (atr_val * 5.0) if side == 'LONG' else entry_price + (atr_val * 5.0)
+                sl_wide = round_to_tick(sl_wide_raw, tick_size)
+
+                report = (
+                    f"✅ **เข้า Position สำเร็จ + คำแนะนำ SL/TP!**\n"
+                    f"วันที่: {now_str}\n"
+                    f"เหรียญ: `{sym.replace('USDT','')}`\n"
+                    f"ราคาปัจจุบัน: `{current_price_str}` USDT\n"
+                    f"ทิศ: **{side}** | Entry: `{entry_price:.6f}` | จำนวน: `{qty_str}`\n\n"
+                    f"🤖 **บอทตั้งอัตโนมัติ**\n"
+                    f"SL: `{sl_price_str}`\n"
+                    f"TP: `{tp_price_str}` (RR 1:2)\n\n"
+                    f"🎯 **คำแนะนำเพิ่มเติม**\n"
+                    f"• เป้า +10%: `{profit_10:.{price_precision}f}`\n"
+                    f"• เป้า +20%: `{profit_20:.{price_precision}f}`\n"
+                    f"• SL ยืด (ถือยาว): `{sl_wide:.{price_precision}f}`"
+                )
+                await send_telegram_report(report)
+                sl_tp_advice_notified.add(sym)
+
+            prev_active_symbols = current_active_symbols.copy()
 
             await cancel_old_pending_limits(client)
 
@@ -982,7 +1097,6 @@ async def main():
                     await send_telegram_report("🛑 บอทหยุดทำงานเรียบร้อย")
                     print(f"{Fore.YELLOW}Shutdown command received. Stopping gracefully...")
                 elif cmd in ['a', 'closeall']:
-                    # ... (โค้ด close all เดิม)
                     for p in active:
                         side = SIDE_SELL if p['side'] == 'LONG' else SIDE_BUY
                         try:
@@ -1005,7 +1119,6 @@ async def main():
                     print(f"{Fore.RED}All positions closed & all orders cancelled!")
 
                 elif cmd in ['c', 'cancel']:
-                    # ... (โค้ด cancel เดิม)
                     try:
                         open_orders = await client.futures_get_open_orders()
                         limit_orders = [o for o in open_orders if o['type'] == 'LIMIT']
@@ -1020,7 +1133,6 @@ async def main():
                         await send_telegram_report(f"❌ เกิดข้อผิดพลาดในการยกเลิก: {e}")
                         print(f"{Fore.RED}Cancel error: {e}")
 
-            # อัปเดต Top 50 Volume ทุก 4 ชม.
             if datetime.now() - last_volume_update > VOLUME_UPDATE_INTERVAL:
                 try:
                     print(f"{Fore.CYAN}Updating Top 100 Volume...")
@@ -1057,19 +1169,44 @@ async def main():
                         if not running: break
                         if free_slots <= 0: break
                         if r['symbol'] in active_symbols or r['symbol'] in pending_symbols: continue
+                        if r['ai'] < 50: continue  # Skip if AI confidence low
+
+                        try:
+                            k = await client.futures_klines(symbol=r['symbol'], interval="4h", limit=100)
+                            df = pd.DataFrame(k, columns=['ts','o','h','l','c','v','ct','qv','nt','tb','tq','i']).astype(float)
+                            high = df['h'].max()
+                            low = df['l'].min()
+                            diff = high - low
+
+                            fib_618 = high - 0.618 * diff
+                            fib_50 = high - 0.5 * diff
+                            fib_382 = high - 0.382 * diff
+
+                            current_p = r['curr_p']
+
+                            if r['side'] == 'LONG':
+                                target_fib = max(fib_618, fib_50, fib_382)
+                                limit_price_raw = max(current_p * (1 - (ENTRY_PULLBACK_PERCENT / 100)), target_fib)
+                                side = SIDE_BUY
+                            else:
+                                target_fib = min(fib_382, fib_50, fib_618)
+                                limit_price_raw = min(current_p * (1 + (ENTRY_PULLBACK_PERCENT / 100)), target_fib)
+                                side = SIDE_SELL
+
+                            tick_size = sym_filters.get(r['symbol'], {}).get('tickSize', 0.001)
+                            limit_price = round_to_tick(limit_price_raw, tick_size)
+
+                        except:
+                            if r['side'] == 'LONG':
+                                limit_price_raw = current_p * (1 - (ENTRY_PULLBACK_PERCENT / 100))
+                                side = SIDE_BUY
+                            else:
+                                limit_price_raw = current_p * (1 + (ENTRY_PULLBACK_PERCENT / 100))
+                                side = SIDE_SELL
+                            tick_size = sym_filters.get(r['symbol'], {}).get('tickSize', 0.001)
+                            limit_price = round_to_tick(limit_price_raw, tick_size)
 
                         p_prec, q_prec = sym_info.get(r['symbol'], (4, 2))
-                        tick_size = sym_filters.get(r['symbol'], {}).get('tickSize', 0.001)
-                        current_p = r['curr_p']
-
-                        if r['side'] == 'LONG':
-                            limit_price_raw = current_p * (1 - (ENTRY_PULLBACK_PERCENT / 100))
-                            side = SIDE_BUY
-                        else:
-                            limit_price_raw = current_p * (1 + (ENTRY_PULLBACK_PERCENT / 100))
-                            side = SIDE_SELL
-                            
-                        limit_price = round_to_tick(limit_price_raw, tick_size)
                         limit_price_str = f"{limit_price:.{p_prec}f}"
 
                         qty = calculate_position_size(bal, limit_price, r['atr'], r['symbol'], sym_filters, sym_info)
@@ -1089,10 +1226,14 @@ async def main():
                                 reduceOnly=False
                             )
                             
-                            print(f"{Fore.YELLOW}⏳ Limit Placed: {r['symbol']} {r['side']} @ {limit_price_str} (Qty: {qty})")
+                            print(f"{Fore.YELLOW}⏳ Limit Placed (Fibonacci Optimized): {r['symbol']} {r['side']} @ {limit_price_str} (Qty: {qty})")
                             
                             await send_telegram_report(
-                                f"⏳ **PENDING LIMIT** #{r['symbol'].replace('USDT','')}\nSide: {r['side']}\nLimit: `{limit_price_str}`\nPullback: {ENTRY_PULLBACK_PERCENT}%\nQty: {qty}")
+                                f"⏳ **PENDING LIMIT (ปรับตาม Fibonacci)** #{r['symbol'].replace('USDT','')}\n"
+                                f"Side: {r['side']}\n"
+                                f"Limit: `{limit_price_str}`\n"
+                                f"Pullback: {ENTRY_PULLBACK_PERCENT}% + Fib Support/Resistance\n"
+                                f"Qty: {qty}")
 
                             pending_symbols.add(r['symbol'])
                             free_slots -= 1

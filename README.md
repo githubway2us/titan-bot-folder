@@ -17,4 +17,56 @@
 - รองรับทั้ง LIVE และ TESTNET
 - ระบบยกเลิก Limit Order เก่าอัตโนมัติ (ป้องกันเงินล็อคค้าง)
 
-### โครงสร้างไฟล์
+# TITAN PRO - Limit Swing Trading Bot v31.3 (AI Enhanced)
+
+บอทเทรด Binance Futures แบบ **Swing Trading** ที่เน้นความปลอดภัยสูง ออกแบบมาเพื่อทุนน้อย (ตั้งค่าเริ่มต้นสำหรับทุน $5–$10) ใช้กลยุทธ์ **Limit Order + Fibonacci Pullback** ร่วมกับ **AI Brain** ที่เรียนรู้จากผลเทรดจริง
+
+## ภาพรวม Dashboard
+
+
+Dashboard แบบเรียลไทม์ มี scrolling ticker, heartbeat animation, รายการ Position และ Pending Limit Orders พร้อมสถานะ
+
+## ฟีเจอร์หลัก
+
+- **สแกนเฉพาะ Top 100 เหรียญตาม 24h Quote Volume** (อัปเดตอัตโนมัติทุก 4 ชั่วโมง)
+- **Multiple Technical Indicators** บน timeframe 15m  
+  → EMA20/50/200, RSI, MACD, Bollinger Bands, ATR, ADX, Volume
+- **เข้าเทรดด้วย Limit Order เท่านั้น**  
+  → รอ Pullback 12% หรือลึกกว่านั้นไปถึงระดับ Fibonacci (61.8%, 50%, 38.2%)
+- **Risk Management เข้มงวดมาก (เหมาะกับทุนน้อย)**
+  - Risk ต่อไม้สูงสุด **0.5%**
+  - Leverage สูงสุด **10x**
+  - เปิด Position พร้อมกันสูงสุด **3 ไม้**
+  - SL = ATR × 2.5, TP = ATR × 6 → Risk:Reward ≈ 1:2.4
+  - ยกเลิก Limit Order อัตโนมัติหากรอนานเกิน 4 ชม.
+- **AI Brain (Neural Network)**  
+  → เรียนรู้จากผลการเทรดจริงของบอท (win/loss)  
+  → ก่อนเปิด Position จะเช็ค AI Confidence – ถ้าต่ำกว่า 50% จะข้ามสัญญาณนั้นไป
+- **Dashboard สวยงามใน Terminal** พร้อม animation และสีสัน
+- **ควบคุมเต็มรูปแบบผ่าน Telegram**
+  - `/help` – แสดงคำสั่งทั้งหมด
+  - `/report` หรือ `/status` – สถานะบอทเต็มรูปแบบ
+  - `/limits` – รายการ Limit Orders ทั้งหมด
+  - `/analyze BTC` – ส่งกราฟ Fibonacci Retracement 4h (dark theme สวยงาม)
+  - `/cancel` – ยกเลิก Limit ทั้งหมด
+  - `/closeall` – ปิดทุก Position
+  - พิมพ์ชื่อเหรียญ เช่น `BTC` → ตอบราคาทันที
+- รองรับทั้ง **Live** และ **Testnet**
+
+## การติดตั้ง
+
+```bash
+# Clone หรือ copy โค้ดมา
+git clone https://github.com/githubway2us/titan-bot-folder.git
+cd titan-pro
+
+# สร้าง virtual environment
+python -m venv venv
+source venv/bin/activate        # Linux/Mac
+# venv\Scripts\activate          # Windows
+
+# ติดตั้ง dependencies
+pip install python-binance python-telegram-bot python-dotenv colorama pandas numpy matplotlib
+
+# ติดตั้ง PyTorch (สำหรับ AI Brain) - แนะนำ CPU only
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
