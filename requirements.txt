@@ -4,3 +4,4 @@ python-dotenv
 colorama
 pandas
 numpy
+matplotlib

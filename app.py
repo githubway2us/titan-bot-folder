@@ -15,6 +15,8 @@ from binance.exceptions import BinanceAPIException
 from dotenv import load_dotenv
 from telegram import Bot
 from telegram.error import TelegramError
+import matplotlib.pyplot as plt
+import io
 
 # --- LOAD ENV FIRST ---
 load_dotenv()
@@ -73,27 +75,27 @@ API_SECRET = os.getenv("BINANCE_API_SECRET")
 if not API_KEY or not API_SECRET:
     print(f"{Fore.RED}Error: ไม่พบ API Key ใน .env file!")
     sys.exit(1)
-
-USE_TESTNET = False
+#False
+USE_TESTNET = True
 
 MEMORY_FILE = "titan_memory.json"
 
 # ==========================================================================
 #                  OPTIMIZED CONFIG FOR $40 BALANCE
 # ==========================================================================
-MAX_LEVERAGE = 30  # ลดเหลือ 30x เพื่อความปลอดภัยกับทุนน้อย (ลด margin ใช้, ลด liquidation risk)
+MAX_LEVERAGE = 20  # ลดเหลือ 30x เพื่อความปลอดภัยกับทุนน้อย (ลด margin ใช้, ลด liquidation risk)
 RISK_PER_TRADE_PERCENT = 0.025  # เสี่ยง 2.5% ต่อไม้ (จากเดิม 2% → เพิ่มนิดเพื่อให้เปิด position ได้ง่ายขึ้น)
 
-MAX_OPEN_POSITIONS = 4
+MAX_OPEN_POSITIONS = 50
 SIGNAL_THRESHOLD_LONG = 6
 SIGNAL_THRESHOLD_SHORT = 7
 ADX_THRESHOLD = 25
 SCAN_BATCH_SIZE = 60
 MIN_NOTIONAL_USDT = 5
-MIN_BALANCE_TO_TRADE = 15.0  # ต้องมีอย่างน้อย $15 เพื่อเริ่มเทรด (ปลอดภัยกว่า)
+MIN_BALANCE_TO_TRADE = 100.0  # ต้องมีอย่างน้อย $15 เพื่อเริ่มเทรด (ปลอดภัยกว่า)
 
 # --- LIMIT ENTRY SETTINGS ---
-ENTRY_PULLBACK_PERCENT = 5.8
+ENTRY_PULLBACK_PERCENT = 3.8
 LIMIT_ORDER_TIMEOUT_HOURS = 2
 
 # SL/TP Settings
@@ -373,7 +375,7 @@ def print_dashboard(balance, active_positions, pending_orders, price_map, btc_pr
 
     # --- Header Section ---
     heartbeat = "❤️" if int(datetime.now().timestamp() * 1.5) % 2 == 0 else "🖤"
-    print(f"{Back.BLACK}║ {mode_str}{Fore.CYAN} TITAN LIMIT SWING v31.3 {Fore.WHITE}│ {Fore.MAGENTA}📊 TOP 50 VOLUME {Fore.WHITE}│ 🕒 {Fore.WHITE}{time_now} {' ':<65}║{Style.RESET_ALL}{Fore.RED}{heartbeat}{Style.RESET_ALL}")
+    print(f"{Back.BLACK}║ {mode_str}{Fore.CYAN} TITAN LIMIT SWING v31.3 {Fore.WHITE}│ {Fore.MAGENTA}📊 TOP 100 VOLUME {Fore.WHITE}│ 🕒 {Fore.WHITE}{time_now} {' ':<65}║{Style.RESET_ALL}{Fore.RED}{heartbeat}{Style.RESET_ALL}")
     print(f"{Back.BLACK}{Fore.CYAN}╠" + "═" * 188 + "╣{Style.RESET_ALL}")
     
     # --- Account Info ---
@@ -470,6 +472,7 @@ def print_dashboard(balance, active_positions, pending_orders, price_map, btc_pr
           f"{Fore.RED}{Style.BRIGHT}Q{Style.NORMAL}{Fore.WHITE} Quit │ "
           f"{Fore.CYAN}📱 Telegram: /help /report /limits {heartbeat_footer.rjust(45)}║")
     print(f"╚{'═' * 186}╝{Style.RESET_ALL}")
+
 # ==========================================================================
 #                  ANALYZE TREND (4h timeframe)
 # ==========================================================================
@@ -615,7 +618,77 @@ async def check_telegram_updates(client, cmd_q, price_map):
                 sym_input = text.upper()
                 sym = sym_input + "USDT"
                 if sym in price_map:
-                    await send_telegram_report(f"💰 **{sym_input}**\nราคา: {price_map[sym]:,.6f} USDT", chat_id)
+                    current_price = price_map[sym]
+
+                    # ดึง klines 4h
+                    k = await client.futures_klines(symbol=sym, interval="4h", limit=100)
+                    df = pd.DataFrame(k, columns=['ts', 'o', 'h', 'l', 'c', 'v', 'ct', 'qv', 'nt', 'tb', 'tq', 'i']).astype(float)
+                    df['ts'] = pd.to_datetime(df['ts'], unit='ms')
+
+                    # คำนวณ Fibonacci levels (ใช้ high/low ในช่วง 100 candles 4h ~16 วัน)
+                    high = df['h'].max()
+                    low = df['l'].min()
+                    diff = high - low
+                    fib_levels = {
+                        '0% (High)': high,
+                        '23.6%': high - 0.236 * diff,
+                        '38.2%': high - 0.382 * diff,
+                        '50%': high - 0.5 * diff,
+                        '61.8%': high - 0.618 * diff,
+                        '78.6%': high - 0.786 * diff,
+                        '100% (Low)': low
+                    }
+
+                    # คำนวณแนวรับแนวต้านจาก Pivot Point (ใช้ last candle)
+                    last_high = df['h'].iloc[-1]
+                    last_low = df['l'].iloc[-1]
+                    last_close = df['c'].iloc[-1]
+                    pivot = (last_high + last_low + last_close) / 3
+                    support1 = 2 * pivot - last_high
+                    resistance1 = 2 * pivot - last_low
+                    support2 = pivot - (last_high - last_low)
+                    resistance2 = pivot + (last_high - last_low)
+
+                    # สร้างกราฟ line chart (simple)
+                    fig, ax = plt.subplots(figsize=(10, 6))
+                    ax.plot(df['ts'], df['c'], label='Close Price', color='blue')
+
+                    # เพิ่มเส้น Fibo dashed lines
+                    for label, level in fib_levels.items():
+                        ax.axhline(y=level, color='red', linestyle='--', label=f'{label}: {level:.6f}')
+
+                    # เพิ่มแนวรับแนวต้าน
+                    ax.axhline(y=support1, color='green', linestyle='-', label=f'S1: {support1:.6f}')
+                    ax.axhline(y=resistance1, color='orange', linestyle='-', label=f'R1: {resistance1:.6f}')
+                    ax.axhline(y=support2, color='darkgreen', linestyle='-', label=f'S2: {support2:.6f}')
+                    ax.axhline(y=resistance2, color='darkorange', linestyle='-', label=f'R2: {resistance2:.6f}')
+
+                    ax.legend(loc='upper left', bbox_to_anchor=(1, 1))
+                    ax.set_title(f"{sym_input} 4h Chart with Fibonacci & S/R Levels")
+                    ax.set_xlabel('Time')
+                    ax.set_ylabel('Price')
+                    plt.tight_layout()
+
+                    # บันทึกกราฟเป็น bytes
+                    buf = io.BytesIO()
+                    fig.savefig(buf, format='png')
+                    buf.seek(0)
+
+                    # ส่งข้อความราคา + Fibo + S/R
+                    report = f"💰 **{sym_input}**\nราคาปัจจุบัน: {current_price:,.6f} USDT\n\n**Fibonacci Levels (จาก High/Low 4h ล่าสุด):**"
+                    for label, level in fib_levels.items():
+                        report += f"\n{label}: {level:.6f}"
+
+                    report += f"\n\n**แนวรับ/แนวต้าน (Pivot Point 4h ล่าสุด):**\nS1: {support1:.6f}\nS2: {support2:.6f}\nR1: {resistance1:.6f}\nR2: {resistance2:.6f}"
+
+                    await telegram_bot.send_message(chat_id=chat_id, text=report, parse_mode="Markdown")
+
+                    # ส่งรูปกราฟ
+                    await telegram_bot.send_photo(chat_id=chat_id, photo=buf)
+
+                    buf.close()
+                    plt.close(fig)
+
                 else:
                     await send_telegram_report("❓ ไม่พบเหรียญนี้", chat_id)
 
@@ -626,7 +699,7 @@ async def check_telegram_updates(client, cmd_q, price_map):
 #                               MAIN
 # ==========================================================================
 async def main():
-    global bal, active, btc_p, pending_orders_detail, running, sym_info, sym_filters, prev_active_symbols
+    global bal, active, btc_p, pending_orders_detail, running, sym_info, sym_filters
     global top_50_symbols, last_volume_update
 
     try:
@@ -638,11 +711,11 @@ async def main():
         
         if telegram_bot:
             greeting = (
-                "🚀 **TITAN PRO v31.3 เริ่มทำงานแล้ว! (Top 50 Volume)**\n"
+                "🚀 **TITAN PRO v31.3 เริ่มทำงานแล้ว! (Top 100 Volume)**\n"
                 f"🕒 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
                 f"⚙️ โหมด: {'🧪 TESTNET' if USE_TESTNET else '🔴 LIVE'}\n"
                 f"💰 Balance: {bal:,.2f} USDT\n"
-                f"🔥 สแกนจาก Top 50 Volume อัปเดตทุก 4 ชม.\n\n"
+                f"🔥 สแกนจาก Top 100 Volume อัปเดตทุก 4 ชม.\n\n"
                 "📱 ควบคุมผ่าน Telegram ได้เต็มรูปแบบ!\n"
                 "พิมพ์ `/help` เพื่อดูคำสั่ง\n"
                 "_LFG!_ 🚀"
@@ -680,7 +753,7 @@ async def main():
 
     # ดึง Top 50 Volume ครั้งแรก
     try:
-        print(f"{Fore.CYAN}Fetching initial Top 50 by 24h Volume...")
+        print(f"{Fore.CYAN}Fetching initial Top 100 by 24h Volume...")
         tickers = await client.futures_ticker()
         volume_list = []
         for t in tickers:
@@ -692,12 +765,12 @@ async def main():
                 except:
                     pass
         volume_list.sort(key=lambda x: x[1], reverse=True)
-        top_50_symbols = [s[0] for s in volume_list[:50]]
+        top_50_symbols = [s[0] for s in volume_list[:100]]
         last_volume_update = datetime.now()
         print(f"{Fore.GREEN}Loaded {len(top_50_symbols)} Top Volume symbols!")
         print(f"{Fore.YELLOW}Top 10: {', '.join(top_50_symbols[:10])}")
     except Exception as e:
-        print(f"{Fore.RED}Failed to load initial Top 50: {e}")
+        print(f"{Fore.RED}Failed to load initial Top 100: {e}")
 
     print(f"{Fore.CYAN}System Ready!")
 
@@ -751,101 +824,133 @@ async def main():
                         'tp': tp
                     })
 
-            # AUTO SET SL/TP FOR NEW POSITIONS
-            current_active_symbols = {p['symbol'] for p in active}
-            new_positions = [p for p in active if p['symbol'] not in prev_active_symbols and p['sl'] == 0.0]
-            
-            for pos in new_positions:
-                # ... (โค้ดตั้ง SL/TP เดิมทั้งหมด ไม่เปลี่ยน)
+            # === ตั้ง SL/TP อัตโนมัติให้ทุก Position ที่ยังไม่มี SL หรือ TP (ทั้งใหม่และเก่า) ===
+            positions_needing_protection = [
+                p for p in active 
+                if p['sl'] == 0.0 or p['tp'] == 0.0  # ยังไม่มี SL หรือไม่มี TP
+            ]
+
+            if positions_needing_protection:
+                print(f"{Fore.CYAN}🛡️ พบ {len(positions_needing_protection)} Position ที่ยังไม่มี SL/TP → กำลังตั้งอัตโนมัติ...")
+            for pos in positions_needing_protection:
                 sym = pos['symbol']
                 side = pos['side']
                 entry_price = pos['entry']
                 qty = abs(pos['amt'])
-                
+
+                # ข้ามถ้ามีทั้ง SL และ TP แล้ว
+                if pos['sl'] > 0 and pos['tp'] > 0:
+                    continue
+
+                print(f"{Fore.CYAN}→ กำลังตั้ง SL/TP ให้ {sym} {side} (Entry: {entry_price:.6f})")
+
                 try:
                     klines = await client.futures_klines(symbol=sym, interval="15m", limit=100)
                     df = calculate_indicators(klines)
-                    if df.empty:
-                        print(f"{Fore.YELLOW}ไม่พบข้อมูล ATR สำหรับ {sym} - ข้ามการตั้ง SL/TP")
+                    if df.empty or len(df) < 50:
+                        print(f"{Fore.YELLOW}ข้อมูลไม่พอสำหรับ {sym} → ข้ามการตั้ง SL/TP")
                         continue
+
                     atr_val = float(df.iloc[-1]['atr'])
+                    if atr_val <= 0:
+                        print(f"{Fore.YELLOW}ATR = 0 สำหรับ {sym} → ข้าม")
+                        continue
+
                 except Exception as e:
                     print(f"{Fore.RED}ดึง ATR ล้มเหลว {sym}: {e}")
                     continue
-                
-                if atr_val <= 0:
-                    print(f"{Fore.YELLOW}ATR = 0 สำหรับ {sym} - ข้ามการตั้ง SL/TP")
-                    continue
-                
+
+                # คำนวณ SL และ TP
                 if side == 'LONG':
                     sl_price_raw = entry_price - (atr_val * ATR_SL_MULTIPLIER)
                     tp_price_raw = entry_price + (atr_val * ATR_TP_MULTIPLIER)
                     sl_side = SIDE_SELL
                     tp_side = SIDE_SELL
-                else:
+                else:  # SHORT
                     sl_price_raw = entry_price + (atr_val * ATR_SL_MULTIPLIER)
                     tp_price_raw = entry_price - (atr_val * ATR_TP_MULTIPLIER)
                     sl_side = SIDE_BUY
                     tp_side = SIDE_BUY
-                
+
                 tick_size = sym_filters.get(sym, {}).get('tickSize', 0.0001)
                 sl_price = round_to_tick(sl_price_raw, tick_size)
                 tp_price = round_to_tick(tp_price_raw, tick_size)
-                
+
                 if sl_price <= 0 or tp_price <= 0:
+                    print(f"{Fore.RED}ราคา SL/TP ไม่ถูกต้อง → ข้าม {sym}")
                     continue
-                
+
                 price_precision = sym_info.get(sym, (4, 2))[0]
                 sl_price_str = f"{sl_price:.{price_precision}f}"
                 tp_price_str = f"{tp_price:.{price_precision}f}"
-                
-                success_sl = False
-                success_tp = False
-                
-                try:
-                    await client.futures_create_order(
-                        symbol=sym,
-                        side=sl_side,
-                        type='STOP_MARKET',
-                        stopPrice=sl_price_str,
-                        closePosition=True,
-                        reduceOnly=True
-                    )
-                    success_sl = True
-                    print(f"{Fore.GREEN}✅ ตั้ง SL อัตโนมัติ: {sym} {side} @ {sl_price}")
-                except Exception as e:
-                    print(f"{Fore.RED}ตั้ง SL ล้มเหลว {sym}: {e}")
-                
-                try:
-                    await client.futures_create_order(
-                        symbol=sym,
-                        side=tp_side,
-                        type='TAKE_PROFIT_MARKET',
-                        stopPrice=tp_price_str,
-                        closePosition=True,
-                        reduceOnly=True
-                    )
-                    success_tp = True
-                    print(f"{Fore.GREEN}✅ ตั้ง TP อัตโนมัติ: {sym} {side} @ {tp_price}")
-                except Exception as e:
-                    print(f"{Fore.RED}ตั้ง TP ล้มเหลว {sym}: {e}")
-                
+
+                success_sl = pos['sl'] > 0  # ถ้ามีอยู่แล้ว = True
+                success_tp = pos['tp'] > 0
+
+                # ตั้ง SL เฉพาะเมื่อยังไม่มี
+                if not success_sl:
+                    try:
+                        await client.futures_create_order(
+                            symbol=sym,
+                            side=sl_side,
+                            type='STOP_MARKET',
+                            stopPrice=sl_price_str,
+                            closePosition=True,
+                            timeInForce=TIME_IN_FORCE_GTC
+                        )
+                        success_sl = True
+                        pos['sl'] = sl_price
+                        print(f"{Fore.GREEN}✅ ตั้ง SL สำเร็จ: {sym} @ {sl_price_str}")
+                    except BinanceAPIException as e:
+                        if "Order would immediately trigger" in str(e):
+                            print(f"{Fore.RED}⚠️ SL ใกล้เกินไป จะทริกเกอร์ทันที → ข้าม SL {sym}")
+                        else:
+                            print(f"{Fore.RED}ตั้ง SL ล้มเหลว {sym}: {e}")
+                    except Exception as e:
+                        print(f"{Fore.RED}ตั้ง SL ล้มเหลว {sym}: {e}")
+
+                # ตั้ง TP เฉพาะเมื่อยังไม่มี
+                if not success_tp:
+                    try:
+                        await client.futures_create_order(
+                            symbol=sym,
+                            side=tp_side,
+                            type='TAKE_PROFIT_MARKET',
+                            stopPrice=tp_price_str,
+                            closePosition=True,
+                            timeInForce=TIME_IN_FORCE_GTC
+                        )
+                        success_tp = True
+                        pos['tp'] = tp_price
+                        print(f"{Fore.GREEN}✅ ตั้ง TP สำเร็จ: {sym} @ {tp_price_str}")
+                    except BinanceAPIException as e:
+                        if "Order would immediately trigger" in str(e):
+                            print(f"{Fore.YELLOW}⚠️ TP ถึงเป้าแล้วหรือใกล้เกินไป → ข้าม TP {sym}")
+                        else:
+                            print(f"{Fore.RED}ตั้ง TP ล้มเหลว {sym}: {e}")
+                    except Exception as e:
+                        print(f"{Fore.RED}ตั้ง TP ล้มเหลว {sym}: {e}")
+
+                # ส่งแจ้งเตือน Telegram ถ้าตั้งสำเร็จอย่างน้อยหนึ่งอย่าง
                 if success_sl or success_tp:
-                    report_lines = [
-                        f"🛡️ **ตั้ง SL/TP อัตโนมัติสำเร็จ!**",
-                        f"เหรียญ: {sym.replace('USDT','')}",
-                        f"ทิศ: {side}",
-                        f"Entry: {entry_price:.4f}",
-                        f"{'SL: ' + str(sl_price) if success_sl else '❌ SL ล้มเหลว'}",
-                        f"{'TP: ' + str(tp_price) + ' (RR 1:2)' if success_tp else '❌ TP ล้มเหลว'}",
-                        f"ระยะ: SL {ATR_SL_MULTIPLIER}x | TP {ATR_TP_MULTIPLIER}x ATR",
-                        f"จำนวน: {qty:.4f}"
-                    ]
-                    await send_telegram_report("\n".join(report_lines))
-                    
-                    pos['sl'] = sl_price
-            
-            prev_active_symbols = current_active_symbols.copy()
+                    rr_ratio = f"1:{ATR_TP_MULTIPLIER / ATR_SL_MULTIPLIER:.1f}"
+                    status = "🟢 ปกป้องแล้ว" if (success_sl and success_tp) else "🟡 ปกป้องบางส่วน"
+                    report = (
+                        f"{status} **ตั้ง SL/TP อัตโนมัติ**\n"
+                        f"เหรียญ: `{sym.replace('USDT', '')}`\n"
+                        f"ทิศ: **{side}**\n"
+                        f"Entry: `{entry_price:.6f}`\n"
+                        f"{'SL: `' + sl_price_str + '`' if success_sl else 'SL: ไม่มี/ล้มเหลว'}\n"
+                        f"{'TP: `' + tp_price_str + '` (RR 1:2)' if success_tp else 'TP: ไม่มี/ล้มเหลว'}\n"
+                        f"ATR × {ATR_SL_MULTIPLIER}/{ATR_TP_MULTIPLIER} → RR {rr_ratio}\n"
+                        f"จำนวน: `{qty:.4f}`"
+                    )
+                    await send_telegram_report(report)
+                else:
+                    await send_telegram_report(
+                        f"⚠️ **ไม่สามารถตั้ง SL/TP ได้** สำหรับ `{sym.replace('USDT', '')}` {side}\n"
+                        f"กรุณาตรวจสอบและตั้งด้วยตนเอง!"
+                    )
 
             await cancel_old_pending_limits(client)
 
@@ -918,7 +1023,7 @@ async def main():
             # อัปเดต Top 50 Volume ทุก 4 ชม.
             if datetime.now() - last_volume_update > VOLUME_UPDATE_INTERVAL:
                 try:
-                    print(f"{Fore.CYAN}Updating Top 50 Volume...")
+                    print(f"{Fore.CYAN}Updating Top 100 Volume...")
                     tickers = await client.futures_ticker()
                     volume_list = []
                     for t in tickers:
@@ -930,11 +1035,11 @@ async def main():
                             except:
                                 pass
                     volume_list.sort(key=lambda x: x[1], reverse=True)
-                    top_50_symbols = [s[0] for s in volume_list[:50]]
+                    top_50_symbols = [s[0] for s in volume_list[:100]]
                     last_volume_update = datetime.now()
-                    print(f"{Fore.GREEN}Top 50 Updated! Top 5: {', '.join(top_50_symbols[:5])}")
+                    print(f"{Fore.GREEN}Top 100 Updated! Top 5: {', '.join(top_50_symbols[:5])}")
                 except Exception as e:
-                    print(f"{Fore.RED}Update Top 50 failed: {e}")
+                    print(f"{Fore.RED}Update Top 100 failed: {e}")
 
             total_active_trade_intent = len(active_symbols) + len(pending_symbols)
             free_slots = MAX_OPEN_POSITIONS - total_active_trade_intent
