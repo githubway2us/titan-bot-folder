@@ -9,3 +9,4 @@ __pycache__/
 titan_memory.json
 *.log
 .DS_Store
+appv3.py
