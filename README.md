@@ -1,5 +1,5 @@
 # titan-bot-folder
-(assets/logo.jpg) 
+![Titan Brain Logic](assets/logo.jpg) 
 # TITAN PRO - Binance Futures Trading Bot 🚀💥
 
 บอทเทรดอัตโนมัติ Binance USDT-M Futures เวอร์ชันโปรเต็มสูบ  
