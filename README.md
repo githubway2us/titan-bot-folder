@@ -152,3 +152,10 @@ pip install torch torchvision torchaudio --index-url https://download.pytorch.or
 - titan_model.pth (AI model - สร้างอัตโนมัติ)
 
 ตัวอย่าง .env:
+BINANCE_API_KEY=your_api_key_here
+BINANCE_API_SECRET=your_api_secret_here
+
+TELEGRAM_BOT_TOKEN=your_telegram_bot_token
+TELEGRAM_CHAT_ID=your_chat_id
+
+USE_TESTNET=true
