@@ -42,6 +42,12 @@ update_offset = None
 running = True
 
 # ==========================================================================
+# เพิ่มตัวแปร global สำหรับ cooldown (เฉพาะ manual close)
+# ==========================================================================
+manual_closed_cooldown = {}           # sym → timestamp ที่ปิดด้วยมือล่าสุด
+COOLDOWN_AFTER_MANUAL_MINUTES = 90    # 90 นาที = 1.5 ชม. (ปรับได้ตามต้องการ)
+
+# ==========================================================================
 #                          TRADE HISTORY
 # ==========================================================================
 TRADE_HISTORY_FILE = "titan_trade_history.csv"
@@ -55,40 +61,6 @@ if not Path(TRADE_HISTORY_FILE).exists():
     with open(TRADE_HISTORY_FILE, 'w', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=TRADE_HISTORY_FIELDS)
         writer.writeheader()
-
-def log_trade_to_csv(trade_data: dict):
-    try:
-        with open(TRADE_HISTORY_FILE, 'a', newline='', encoding='utf-8') as f:
-            writer = csv.DictWriter(f, fieldnames=TRADE_HISTORY_FIELDS)
-            writer.writerow(trade_data)
-        
-        features = trade_data.get('features', [])
-        if features:
-            brain.update_memory(features, trade_data['is_win'])
-    except Exception as e:
-        print(f"{Fore.RED}Error logging trade: {e}")
-
-# แก้ในฟังก์ชัน get_current_winrate() ให้แข็งแรงขึ้นหน่อย
-def get_current_winrate():
-    try:
-        df = pd.read_csv(TRADE_HISTORY_FILE)
-        if df.empty:
-            return 0.0, 0, 0
-        
-        # กรองเฉพาะ trade ที่มี exit_price และ pnl ชัดเจน
-        df_valid = df.dropna(subset=['exit_price', 'pnl'])
-        
-        total = len(df_valid)
-        wins = len(df_valid[df_valid['is_win'] == True])
-        winrate = (wins / total * 100) if total > 0 else 0.0
-        
-        return winrate, wins, total
-    except FileNotFoundError:
-        print("⚠️ ไม่พบไฟล์ trade history → winrate = 0%")
-        return 0.0, 0, 0
-    except Exception as e:
-        print(f"Error reading trade history: {e}")
-        return 0.0, 0, 0
 
 # Global variables
 prev_prices = {}
@@ -172,8 +144,64 @@ MAJOR_TICKER_SYMBOLS = [
 
 prev_prices = {sym: 0.0 for sym in MAJOR_TICKER_SYMBOLS}
 
-
+# ==========================================================================
 def log_trade_to_csv(trade_data: dict):
+    """บันทึก trade ลง CSV และอัพเดท brain memory (เวอร์ชันสมบูรณ์)"""
+    try:
+        # ถ้า timestamp เป็น datetime → แปลงเป็น ISO string
+        if isinstance(trade_data.get('timestamp'), datetime):
+            trade_data['timestamp'] = trade_data['timestamp'].isoformat()
+
+        row = {k: trade_data.get(k, '') for k in TRADE_HISTORY_FIELDS}
+
+        with open(TRADE_HISTORY_FILE, 'a', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=TRADE_HISTORY_FIELDS)
+            writer.writerow(row)
+
+        print(f"{Fore.GREEN}บันทึก trade → {trade_data.get('symbol','?')} | PNL {trade_data.get('pnl',0):+.2f}{Style.RESET_ALL}")
+
+        # อัพเดท AI brain
+        features = trade_data.get('features', [])
+        if features and isinstance(features, (list, tuple)):
+            try:
+                brain.update_memory(features, trade_data['is_win'])
+            except Exception as brain_err:
+                print(f"{Fore.YELLOW}AI memory update ล้มเหลว: {brain_err}{Style.RESET_ALL}")
+
+    except Exception as e:
+        print(f"{Fore.RED}Error logging trade to CSV: {e}{Style.RESET_ALL}")
+    try:
+        with open(TRADE_HISTORY_FILE, 'a', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=TRADE_HISTORY_FIELDS)
+            writer.writerow(trade_data)
+        
+        features = trade_data.get('features', [])
+        if features:
+            brain.update_memory(features, trade_data['is_win'])
+    except Exception as e:
+        print(f"{Fore.RED}Error logging trade: {e}")
+
+# แก้ในฟังก์ชัน get_current_winrate() ให้แข็งแรงขึ้นหน่อย
+def get_current_winrate():
+    try:
+        df = pd.read_csv(TRADE_HISTORY_FILE)
+        if df.empty:
+            return 0.0, 0, 0
+        
+        # กรองเฉพาะ trade ที่มี exit_price และ pnl ชัดเจน
+        df_valid = df.dropna(subset=['exit_price', 'pnl'])
+        
+        total = len(df_valid)
+        wins = len(df_valid[df_valid['is_win'] == True])
+        winrate = (wins / total * 100) if total > 0 else 0.0
+        
+        return winrate, wins, total
+    except FileNotFoundError:
+        print("⚠️ ไม่พบไฟล์ trade history → winrate = 0%")
+        return 0.0, 0, 0
+    except Exception as e:
+        print(f"Error reading trade history: {e}")
+        return 0.0, 0, 0
     """บันทึก trade ลง CSV และอัพเดท brain memory"""
     try:
         with open(TRADE_HISTORY_FILE, 'a', newline='', encoding='utf-8') as f:
@@ -188,7 +216,7 @@ def log_trade_to_csv(trade_data: dict):
     except Exception as e:
         print(f"{Fore.RED}Error logging trade to CSV: {e}")
 
-
+# ==========================================================================
 def get_recent_trades(n=10):
     try:
         df = pd.read_csv(TRADE_HISTORY_FILE)
@@ -681,7 +709,6 @@ class TitanBrain:
 
 brain = TitanBrain()
 
-
 # ==========================================================================
 #                         AI MATRIX ENGINE
 # ==========================================================================
@@ -714,14 +741,14 @@ async def analyze_matrix(client, symbol):
             long_score += 1
 
         short_score = 0
-        if curr['c'] < curr['ema200']: short_score += 1
-        if curr['ema20'] < curr['ema50']: short_score += 1
-        if curr['rsi'] < 50: short_score += 1
-        if curr['macd'] < curr['signal']: short_score += 1
+        if curr['c'] < curr['ema200']: short_score += 2       # เพิ่มน้ำหนัก
+        if curr['ema20'] < curr['ema50']: short_score += 2    # เพิ่มน้ำหนัก
+        if curr['macd'] < curr['signal']: short_score += 2    # เพิ่มน้ำหนัก
         if curr['c'] < curr['bb_lower']: short_score += 1
-        if curr['v'] > curr['vol_ma']: short_score += 1
+        if curr['rsi'] > 72: short_score += 2                 # เข้มงวดขึ้น (จาก 70 → 72)
         if curr['c'] < curr['o']: short_score += 1
-        if curr['adx'] > ADX_THRESHOLD: short_score += 1
+        if curr['adx'] > 32: short_score += 2                 # ADX ต้องสูงขึ้น (จาก 28 → 32)
+        if curr['vol_breakout'] == 1: short_score += 2        # Volume breakout มีน้ำหนักมากขึ้น
 
         # เพิ่ม Volume Breakout for SHORT
         if curr['vol_breakout'] == 1:
@@ -731,12 +758,13 @@ async def analyze_matrix(client, symbol):
         if curr['rsi'] > 70:
             short_score += 1
 
+        # เพิ่มเงื่อนไขเสริม: ต้องมี momentum ลงชัด + BTC ไม่ขาขึ้นแรง
         btc_k = await client.futures_klines(symbol="BTCUSDT", interval="15m", limit=250)
         btc_df = calculate_indicators(btc_k)
         if not btc_df.empty:
             btc_curr = btc_df.iloc[-1]
-            if btc_curr['c'] > btc_curr['ema200']:
-                short_score = 0  
+            if btc_curr['macd'] > btc_curr['signal'] and btc_curr['c'] > btc_curr['ema50']:
+                short_score = max(0, short_score - 3)  # ลดคะแนนถ้า BTC กำลัง bullish
 
         side = "LONG" if long_score >= SIGNAL_THRESHOLD_LONG else "SHORT" if short_score >= SIGNAL_THRESHOLD_SHORT else None
         score = long_score if side == "LONG" else short_score
@@ -789,7 +817,6 @@ def round_to_tick(price: float, tick_size: float) -> float:
     if tick_size <= 0:
         return price
     return round(price / tick_size) * tick_size
-
 
 # ==========================================================================
 #                       RISK MANAGEMENT
@@ -1036,7 +1063,6 @@ async def print_dashboard(client, balance, active_positions, pending_orders, pri
           f"{Fore.RED}{Style.BRIGHT}Q{Style.NORMAL}{Fore.WHITE} Quit │ "
           f"{Fore.CYAN}📱 Telegram: /help /report /limits {heartbeat_footer.rjust(45)}║")
     print(f"╚{'═' * 186}╝{Style.RESET_ALL}")
-
 
 # ==========================================================================
 #                  AUTO ENTER: VOLUME SPIKE → MARKET LONG ($0.5 risk)
@@ -1630,6 +1656,7 @@ async def get_sentiment(symbol):
         print(f"{Fore.RED}Sentiment fetch error for {symbol}: {e}")
         return 0.5  # Default neutral
 
+# ==========================================================================
 async def main():
     global bal, active, btc_p, pending_orders_detail, running
     global sym_info, sym_filters, top_50_symbols, last_volume_update
@@ -1960,7 +1987,9 @@ async def main():
                             print(f"{Fore.RED}Error processing new position {sym}: {e}")
 
                     # จัดการ position ที่ปิดไป → บันทึก trade ลง CSV + แจ้งเตือน
-                    # จัดการ position ที่ปิดไป → บันทึก trade ลง CSV + แจ้งเตือน
+                    # ==========================================================================
+                    # จัดการ position ที่ปิดไป
+                    # ==========================================================================
                     for sym in closed_positions:
                         pos_info = active_detailed.pop(sym, None)
                         if not pos_info:
@@ -1968,38 +1997,42 @@ async def main():
                             continue
 
                         try:
-                            # Retry 3 ครั้งเพื่อรอ Binance sync trade
                             close_trades = []
-                            for retry in range(3):
+                            for retry in range(4):
                                 trades = await client.futures_account_trades(symbol=sym, limit=50)
-                                close_trades = [t for t in trades if float(t['realizedPnl']) != 0]
+                                close_trades = [t for t in trades if float(t.get('realizedPnl', 0)) != 0]
                                 if close_trades:
                                     break
-                                await asyncio.sleep(2)  # รอ 2 วินาทีแล้วลองใหม่
-                                print(f"Retry {retry+1}/3: รอข้อมูล trade ของ {sym}")
+                                await asyncio.sleep(2.0)
 
                             if not close_trades:
-                                print(f"{Fore.YELLOW}ยังไม่พบ realized PnL สำหรับ {sym} หลัง retry → ข้ามบันทึก")
+                                print(f"{Fore.YELLOW}ไม่พบ realized PnL สำหรับ {sym} → ข้ามบันทึก")
                                 continue
 
-                            last_trade = close_trades[-1]
+                            last_trade = max(close_trades, key=lambda t: int(t['time']))
                             exit_price = float(last_trade['price'])
                             pnl = float(last_trade['realizedPnl'])
                             is_win = pnl > 0
 
-                            exit_time = datetime.fromtimestamp(last_trade['time'] / 1000)
+                            exit_time = datetime.fromtimestamp(int(last_trade['time']) / 1000)
                             duration_hours = (exit_time - pos_info['entry_time']).total_seconds() / 3600
 
-                            margin = pos_info['quantity'] * pos_info['entry_price'] / pos_info['leverage']
-                            pnl_percent = (pnl / margin * 100) if margin > 0 else 0
+                            margin = abs(pos_info['quantity'] * pos_info['entry_price'] / pos_info['leverage'])
+                            pnl_percent = (pnl / margin * 100) if margin > 1e-8 else 0.0
 
                             exit_reason = "Manual / Other"
-                            if 'STOP_MARKET' in last_trade.get('origType', ''):
+                            orig_type = last_trade.get('origType', '')
+                            if 'STOP_MARKET' in orig_type:
                                 exit_reason = "Hit SL"
-                            elif 'TAKE_PROFIT_MARKET' in last_trade.get('origType', ''):
+                            elif 'TAKE_PROFIT_MARKET' in orig_type:
                                 exit_reason = "Hit TP"
-                            elif pnl < -margin * 0.5:
+                            elif pnl < -margin * 0.7:
                                 exit_reason = "Liquidation / Big Loss"
+
+                            # ถ้าเป็นการปิดด้วยมือ หรือ closeall → ใส่ cooldown
+                            if exit_reason in ["Manual / Other", "Manual Close (closeall)"]:
+                                manual_closed_cooldown[sym] = datetime.now().timestamp()
+                                print(f"{Fore.MAGENTA}Manual/closeall detected → cooldown {sym} {COOLDOWN_AFTER_MANUAL_MINUTES} นาที{Style.RESET_ALL}")
 
                             trade_record = {
                                 'timestamp': exit_time.isoformat(),
@@ -2014,8 +2047,8 @@ async def main():
                                 'exit_reason': exit_reason,
                                 'is_win': is_win,
                                 'leverage': pos_info['leverage'],
-                                'max_roe_percent': pos_info['max_roe'],
-                                'features': pos_info['features']
+                                'max_roe_percent': pos_info.get('max_roe', 0.0),
+                                'features': pos_info.get('features', [])
                             }
 
                             log_trade_to_csv(trade_record)
@@ -2032,7 +2065,7 @@ async def main():
                                 f"PNL: {pnl_emoji} `{pnl:+.2f}` USDT (`{pnl_percent:+.2f}%`)\n"
                                 f"เหตุผล: **{exit_reason}**\n"
                                 f"ระยะเวลา: `{duration_hours:.1f}` ชม\n"
-                                f"Max ROE: `{pos_info['max_roe']:+.2f}%`\n"
+                                f"Max ROE: `{pos_info.get('max_roe', 0.0):+.2f}%`\n"
                                 f"สถิติรวม: {wins}/{total} | Winrate {wr:.1f}%"
                             )
                             await send_telegram_report(report)
@@ -2283,6 +2316,18 @@ async def main():
                                     break
                                 if r['symbol'] in active_symbols or r['symbol'] in pending_symbols:
                                     continue
+                                # ─── Cooldown check เฉพาะ manual close ───────────────────────────────
+                                now_ts = datetime.now().timestamp()
+                                if r['symbol'] in manual_closed_cooldown:
+                                    elapsed_sec = now_ts - manual_closed_cooldown[r['symbol']]
+                                    if elapsed_sec < COOLDOWN_AFTER_MANUAL_MINUTES * 60:
+                                        remain_min = int((COOLDOWN_AFTER_MANUAL_MINUTES * 60 - elapsed_sec) / 60) + 1
+                                        print(f"Skip {r['symbol']} — cooldown เหลือ ~{remain_min} นาที (manual close)")
+                                        continue
+                                    else:
+                                        # cooldown หมดแล้ว ลบออก
+                                        del manual_closed_cooldown[r['symbol']]
+                                # ────────────────────────────────────────────────────────────────────────
                                 if r['ai'] < 50:
                                     continue
                                 if r['vol_breakout'] == 0:
