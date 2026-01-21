@@ -98,9 +98,7 @@ signal_features = {}
 
 atr_cache = {}
 ATR_CACHE_DURATION = timedelta(minutes=2)
-
-TRAILING_ACTIVATION_MULTIPLIER = 1.8
-TRAILING_DELTA_MULTIPLIER = 1.3
+# ==========================================================================
 
 if TELEGRAM_BOT_TOKEN:
     try:
@@ -124,33 +122,38 @@ USE_TESTNET = False
 MEMORY_FILE = "titan_memory.json"
 
 # ==========================================================================
-#                                 CONFIG (ปรับให้เข้าเร็วขึ้น + ทุน $100)
+#          CONFIG สำหรับกำไรสูงสุด (Aggressive Profit Mode) 2026
 # ==========================================================================
 
-MAX_LEVERAGE          = 25              # คงเดิม (20x ยังโอเคสำหรับทุนเล็ก)
+# --- Trailing Stop (สำคัญที่สุดสำหรับกำไรสูงสุด) ---
+TRAILING_ACTIVATION_MULTIPLIER = 2.5          # จาก 1.8 → ปล่อยให้กำไรวิ่งไกลกว่านี้ก่อนเริ่ม trailing
+TRAILING_DELTA_MULTIPLIER     = 2.0           # จาก 1.3 → trailing ห่างมากขึ้น ให้กำไรวิ่งต่อ
 
-RISK_PER_TRADE_PERCENT = 0.02          # คงเดิม ($0.5 ต่อเทรด)
+# --- Risk & Position Management ---
+RISK_PER_TRADE_PERCENT        = 0.025         # จาก 0.02 → เสี่ยง $0.625–0.75 ต่อเทรด (ทุน $100)
+MAX_OPEN_POSITIONS            = 5             # จาก 3 → เปิดได้มากขึ้น (เพิ่มโอกาส)
+MAX_LEVERAGE                  = 30            # จาก 25 → ใช้สูงขึ้นในเทรนด์แรง (แต่มี guard)
 
-MAX_OPEN_POSITIONS    = 3               # เพิ่มจาก 5 → 8 (ให้เปิดได้มากขึ้นนิดหน่อย เพราะเข้าเร็วขึ้น)
+# --- Signal & Entry (เข้าเร็ว + เยอะขึ้น) ---
+SIGNAL_THRESHOLD_LONG         = 5.5           # จาก 7 → ผ่อนปรนมากขึ้น เจอสัญญาณไว
+SIGNAL_THRESHOLD_SHORT        = 5.5           # เดียวกัน
+ADX_THRESHOLD                 = 22            # จาก 28 → ยอมรับเทรนด์อ่อน/เริ่มต้น
+SCAN_BATCH_SIZE               = 100           # จาก 40 → สแกนเยอะขึ้นมาก
+ENTRY_PULLBACK_PERCENT        = 25.0          # จาก 38 → เข้าใกล้ราคาปัจจุบันมากขึ้น (fill ไว)
 
-SIGNAL_THRESHOLD_LONG  = 7              # ลดจาก 7 → 6 (ผ่อนปรนมากขึ้น → เจอสัญญาณ LONG เร็วขึ้น)
-SIGNAL_THRESHOLD_SHORT = 7              # ลดจาก 7 → 6 (เดียวกันสำหรับ SHORT)
+# --- SL/TP (ให้กำไรวิ่งไกล แต่ SL ยังป้องกัน) ---
+ATR_SL_MULTIPLIER             = 2.2           # จาก 2.8 → SL กว้างขึ้นนิด ให้ราคาหายใจ
+ATR_TP_MULTIPLIER             = 6.0           # จาก 4.6 → TP ไกลขึ้นมาก (หวัง RR สูง)
+MIN_RR_FOR_ENTRY              = 1.8           # ต่ำลงจาก 2.0 เพื่อให้เข้าได้บ่อยขึ้น
 
-ADX_THRESHOLD         = 28              # ลดจาก 28 → 25 (ADX ต่ำลง = ยอมรับเทรนด์ที่เริ่มต้นเร็วขึ้น)
+# --- อื่น ๆ (ความเร็ว + ความปลอดภัย) ---
+LIMIT_ORDER_TIMEOUT_HOURS     = 1.5           # จาก 2.0 → ยกเลิกเก่าเร็วขึ้น
+MIN_BALANCE_TO_TRADE          = 12.0          # จาก 15 → เริ่มเทรดได้เร็วกว่า
+MIN_NOTIONAL_USDT             = 4             # จาก 5 → เข้าได้กับ position เล็ก
 
-SCAN_BATCH_SIZE       = 40              # เพิ่มจาก 40 → 80 (สแกนเหรียญมากขึ้นต่อรอบ → โอกาสเจอสัญญาณเร็ว)
-
-MIN_NOTIONAL_USDT     = 5               # คงเดิม
-
-MIN_BALANCE_TO_TRADE  = 15.0            # ลดจาก 20 → 15 (เริ่มเทรดได้เร็วขึ้นถ้าบัญชีใกล้หมด)
-
-ENTRY_PULLBACK_PERCENT = 38.0           # ลดจาก 18 → 12% (pullback น้อยลง = วาง limit ใกล้ราคาปัจจุบันมากขึ้น → fill ไว)
-
-LIMIT_ORDER_TIMEOUT_HOURS = 2.0         # ลดจาก 2 → 1 ชม. (ยกเลิก limit เก่าเร็วขึ้น → slot ว่างไว)
-
-ATR_SL_MULTIPLIER     = 2.8             # ลดจาก 2.0 → 1.8 (SL แคบลงนิด → risk น้อยลง แต่ยังสมเหตุสมผล)
-
-ATR_TP_MULTIPLIER     = 4.6             # ลดจาก 4.0 → 3.6 (TP แคบลงตาม → RR ยัง ~1:2 แต่เข้า/ออกไวขึ้น)
+# --- Guard ป้องกัน over-leverage / ล้างพอร์ต ---
+#MAX_TOTAL_RISK_PERCENT        = 0.12          # รวมทุก position เสี่ยงไม่เกิน 12% ของพอร์ต
+#TRAILING_STOP_ON_PROFIT_ONLY  = True          # trailing เฉพาะเมื่อกำไร (ป้องกันเบรกอีเว่นเร็ว)
 
 MAJOR_TICKER_SYMBOLS = [
     'BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'BNBUSDT', 'XRPUSDT', 'ADAUSDT',
@@ -3693,7 +3696,58 @@ async def execute_fast_scan_entry(client, scan_result, price_map):
         print(f"[EXECUTE ERROR] {sym}: {reason}")
         await send_telegram_report(f"❌ FAST SCAN ENTRY ล้มเหลว {sym}: {reason}")
         return False
+async def get_analysis_data(client, sym):
+    """
+    ดึงข้อมูลวิเคราะห์สดสำหรับ Counter-Trend
+    """
+    try:
+        # 4H
+        k_4h = await client.futures_klines(symbol=sym, interval="4h", limit=100)
+        df_4h = calculate_indicators(k_4h)
+        curr_4h = df_4h.iloc[-1]
+        
+        # 1H
+        k_1h = await client.futures_klines(symbol=sym, interval="1h", limit=100)
+        df_1h = calculate_indicators(k_1h)
+        curr_1h = df_1h.iloc[-1]
+        
+        # Trend
+        trend_4h = "Bullish" if curr_4h['ema20'] > curr_4h['ema50'] > curr_4h['ema200'] else \
+                  "Bearish" if curr_4h['ema20'] < curr_4h['ema50'] < curr_4h['ema200'] else \
+                  "Sideways"
+        
+        trend_1h = "Bullish" if curr_1h['ema20'] > curr_1h['ema50'] > curr_1h['ema200'] else \
+                  "Bearish" if curr_1h['ema20'] < curr_1h['ema50'] < curr_1h['ema200'] else \
+                  "Sideways"
+        
+        # MACD
+        macd_status = "Bullish" if curr_4h['macd'] > curr_4h['signal'] else "Bearish"
+        
+        # Fib
+        high_4h = df_4h['h'].max()
+        low_4h = df_4h['l'].min()
+        diff = high_4h - low_4h
+        fib_382 = high_4h - 0.382 * diff
+        fib_618 = high_4h - 0.618 * diff
+        
+        return {
+            'price_current': float(curr_4h['c']),
+            'trend_4h': trend_4h,
+            'trend_1h': trend_1h,
+            'rsi_4h': float(curr_4h['rsi']),
+            'stoch_4h': float(curr_4h.get('stoch_k', 50)),
+            'stoch_1h': float(curr_1h.get('stoch_k', 50)),
+            'macd': macd_status,
+            'support': float(curr_4h.get('support', 0)),
+            'resistance': float(curr_4h.get('resistance', 0)),
+            'fib_382': fib_382,
+            'fib_618': fib_618,
+            'atr': float(curr_4h['atr'])
+        }
     
+    except Exception as e:
+        print(f"[get_analysis_data Error] {sym}: {e}")
+        return None
 # ==========================================================================
 #                  TELEGRAM COMMAND LISTENER (รวมทุกคำสั่งล่าสุด - แก้ Indentation แล้ว)
 # ==========================================================================
@@ -3860,6 +3914,226 @@ async def check_telegram_updates(client, cmd_q, price_map):
                     f"_บอท AI ยิ่งเล่นมากเทยิ่งฉลาด_ 🚀"
                 )
                 await send_telegram_report(ai_text, chat_id)
+            # ==========================================================================
+            #                  คำสั่ง /lmauto <symbol>
+            # ==========================================================================
+
+            # ใน check_telegram_updates เพิ่มส่วนนี้:
+
+            elif text.startswith('/lmauto '):
+                try:
+                    parts = text.split()
+                    if len(parts) < 2:
+                        await send_telegram_report("❌ ใช้: `/lmauto ETH` หรือ `/lmauto BTC`", chat_id)
+                        continue
+
+                    sym_input = parts[1].upper()
+                    sym = sym_input + 'USDT' if not sym_input.endswith('USDT') else sym_input
+
+                    if sym not in sym_info:
+                        await send_telegram_report(f"❌ ไม่รองรับ {sym_input}", chat_id)
+                        continue
+
+                    # ตรวจ position / pending
+                    if any(p['symbol'] == sym for p in active) or any(o['symbol'] == sym for o in pending_orders_detail):
+                        await send_telegram_report(f"⚠️ {sym_input} มี Position หรือ Limit อยู่แล้ว", chat_id)
+                        continue
+
+                    await send_telegram_report(f"⏳ กำลังวิเคราะห์ ICT Smart Money + วาง Limit Auto สำหรับ {sym_input}...", chat_id)
+
+                    ict_data = await analyze_ict_smart_money(client, sym)
+                    if ict_data is None:
+                        await send_telegram_report(
+                            f"❌ การวิเคราะห์ ICT สำหรับ {sym_input} ล้มเหลว (ข้อมูลไม่เพียงพอหรือ API error)\n"
+                            f"ลองใหม่ใน 5-10 นาที หรือเช็คด้วย /analyze {sym_input}",
+                            chat_id
+                        )
+                        continue
+
+                    if not ict_data.get('direction'):
+                        await send_telegram_report(
+                            f"⚠️ ไม่พบ confluence ICT ขั้นสูงเพียงพอสำหรับ {sym_input}\n"
+                            f"Score: {ict_data.get('total_score', 0):.1f} (ต้องการ ≥4)",
+                            chat_id
+                        )
+                        continue
+
+                    direction = ict_data['direction'].upper()
+                    side_order = SIDE_BUY if direction == 'LONG' else SIDE_SELL
+
+                    # กำหนด Limit Price จาก confluence
+                    atr = await get_cached_atr(client, sym) or 0.015 * (await get_current_price(client, sym))
+                    limit_price_raw = 0.0
+
+                    if 'liquidity_sweep' in ict_data:
+                        # เข้า Limit ตรงปลาย wick
+                        if ict_data.get('sweep_direction') == 'down':
+                            limit_price_raw = (await get_current_price(client, sym)) - atr * 0.3
+                        else:
+                            limit_price_raw = (await get_current_price(client, sym)) + atr * 0.3
+
+                    if 'order_block' in ict_data:
+                        limit_price_raw = ict_data['ob_level']
+
+                    if 'fvg' in ict_data:
+                        limit_price_raw = ict_data['fvg_mid'] or limit_price_raw
+
+                    if limit_price_raw == 0:
+                        limit_price_raw = (await get_current_price(client, sym)) * (0.985 if direction == 'LONG' else 1.015)
+
+                    # SL สั้นมาก (หลัง wick / swing)
+                    sl_raw = limit_price_raw - atr * 0.8 if direction == 'LONG' else limit_price_raw + atr * 0.8
+
+                    # TP ไกล (RR เป้าหมาย 1:3+)
+                    tp_raw = limit_price_raw + atr * 5.0 if direction == 'LONG' else limit_price_raw - atr * 5.0
+
+                    rr = calculate_rr_ratio(limit_price_raw, sl_raw, tp_raw, direction)
+                    if rr < 2.5:  # เข้มงวดเพราะ aggressive
+                        await send_telegram_report(f"⚠️ RR ไม่ถึงเกณฑ์ (ได้ {rr:.2f}) สำหรับ {sym_input}", chat_id)
+                        continue
+
+                    # Position sizing (risk $0.50)
+                    stop_distance = abs(limit_price_raw - sl_raw)
+                    position_value = 0.50 / (stop_distance / limit_price_raw)
+                    qty = position_value / limit_price_raw
+
+                    step_size = sym_filters.get(sym, {}).get('stepSize', 0.001)
+                    qty = math.floor(qty / step_size) * step_size or step_size * 5
+
+                    qty_str = f"{qty:.{sym_info.get(sym, (4,2))[1]}f}"
+
+                    # ปัดราคา
+                    tick_size = sym_filters.get(sym, {}).get('tickSize', 0.0001)
+                    p_prec = sym_info.get(sym, (4,2))[0]
+                    limit_price = round_to_tick(limit_price_raw, tick_size)
+                    sl_price = round_to_tick(sl_raw, tick_size)
+                    tp_price = round_to_tick(tp_raw, tick_size)
+
+                    limit_str = f"{limit_price:.{p_prec}f}"
+                    sl_str = f"{sl_price:.{p_prec}f}"
+                    tp_str = f"{tp_price:.{p_prec}f}"
+
+                    # สั่ง Limit + SL/TP
+                    await client.futures_change_leverage(symbol=sym, leverage=MAX_LEVERAGE)
+                    order = await client.futures_create_order(
+                        symbol=sym,
+                        side=side_order,
+                        type='LIMIT',
+                        timeInForce='GTC',
+                        quantity=qty_str,
+                        price=limit_str
+                    )
+
+                    close_side = SIDE_SELL if direction == 'LONG' else SIDE_BUY
+                    await client.futures_create_order(symbol=sym, side=close_side, type='STOP_MARKET', stopPrice=sl_str, closePosition=True, reduceOnly=True)
+                    await client.futures_create_order(symbol=sym, side=close_side, type='TAKE_PROFIT_MARKET', stopPrice=tp_str, closePosition=True, reduceOnly=True)
+
+                    # รายงาน
+                    report = (
+                        f"🔥 **/lmauto เข้าสำเร็จ - ICT Smart Money**\n"
+                        f"เหรียญ: `{sym_input}` | ทิศ: **{direction}**\n"
+                        f"Limit: `{limit_str}`\n"
+                        f"SL: `{sl_str}` (สั้นมาก)\n"
+                        f"TP: `{tp_str}` (RR {rr:.2f}:1)\n"
+                        f"Qty: `{qty_str}` | Lev: `{MAX_LEVERAGE}x`\n"
+                        f"Confluence Score: `{ict_data['total_score']:.1f}`\n\n"
+                        f"เงื่อนไขที่เจอ:\n"
+                        + "\n".join([f"• {k.replace('_',' ').title()}" for k in ict_data if ict_data[k] is True or isinstance(ict_data[k], (int,float,str))])
+                    )
+                    await send_telegram_report(report, chat_id)
+
+                    # บันทึก pending
+                    pending_orders_detail.append({
+                        'symbol': sym,
+                        'side': side_order,
+                        'price': limit_price,
+                        'qty': qty,
+                        'time': datetime.now(),
+                        'orderId': order['orderId'],
+                        'source': 'lmauto_ict',
+                        'rr': rr
+                    })
+
+                except Exception as e:
+                    await send_telegram_report(f"❌ /lmauto ล้มเหลว {sym_input}: {str(e)}", chat_id)
+            # ==========================================================================
+            #                  เพิ่มคำสั่ง /ctai <symbol> ใน Telegram Handler
+            # ==========================================================================
+
+            # ในฟังก์ชัน async def check_telegram_updates(client, cmd_q, price_map):
+            # ให้เพิ่ม elif นี้ลงไป (วางไว้ใกล้ ๆ กับ elif text.startswith('/analyze ') หรือคำสั่งอื่น ๆ)
+
+            elif text.startswith('/ctai '):
+                try:
+                    parts = text.split()
+                    if len(parts) < 2:
+                        await send_telegram_report(
+                            "❌ รูปแบบไม่ถูกต้อง\n"
+                            "ใช้: `/ctai BTC` หรือ `/ctai AVAX` เพื่อเข้า Counter-Trend อัตโนมัติ",
+                            chat_id
+                        )
+                        continue
+
+                    sym_input = parts[1].upper()
+                    sym = sym_input + 'USDT' if not sym_input.endswith('USDT') else sym_input
+
+                    if sym not in sym_info:
+                        await send_telegram_report(f"❌ ไม่รองรับเหรียญ {sym_input}", chat_id)
+                        continue
+
+                    # 1. ตรวจสอบว่ามี position หรือ pending limit อยู่แล้วหรือไม่ (ป้องกันซ้ำ)
+                    if any(p['symbol'] == sym for p in active) or \
+                    any(o['symbol'] == sym for o in pending_orders_detail):
+                        await send_telegram_report(
+                            f"⚠️ {sym_input} มี Position หรือ Limit Order อยู่แล้ว → ข้ามการเข้าใหม่",
+                            chat_id
+                        )
+                        continue
+
+                    # 2. แจ้งกำลังทำงาน
+                    await send_telegram_report(
+                        f"⏳ กำลังวิเคราะห์และเข้า **Counter-Trend** สำหรับ {sym_input}...\n"
+                        f"(รอสักครู่... กำลังเช็คแนวโน้ม + วาง Limit Order)",
+                        chat_id
+                    )
+
+                    # 3. ดึงข้อมูลวิเคราะห์สด
+                    analysis_data = await get_analysis_data(client, sym)  # ← ถูกต้อง มี underscore และ A ใหญ่
+                    if not analysis_data:
+                        await send_telegram_report(f"❌ ไม่สามารถดึงข้อมูลวิเคราะห์ {sym_input} ได้", chat_id)
+                        continue
+
+                    # 4. เรียกฟังก์ชัน Counter-Trend (ใช้ฟังก์ชันที่เราปรับแล้ว)
+                    # ในส่วน elif text.startswith('/ctai '):
+                    result = await place_counter_trend_limit(
+                        client=client,
+                        symbol=sym,
+                        analysis_data=analysis_data,   # ต้องตรงกับ def ด้านล่าง
+                        risk_usdt=0.50,
+                        min_rr=1.5
+                    )
+
+                    if result and result.get('success'):
+                        # ถ้าสำเร็จ → รายงานเพิ่มเติม (ถ้าต้องการแจ้งเตือนซ้ำหรือ log)
+                        success_msg = (
+                            f"✅ **เข้า Counter-Trend สำเร็จ!**\n"
+                            f"เหรียญ: {sym_input}\n"
+                            f"ทิศทาง: {result['direction']}\n"
+                            f"Limit Price: {result['limit_price']:.4f}\n"
+                            f"SL: {result['sl']:.4f} | TP: {result['tp']:.4f}\n"
+                            f"RR: {result['rr']:.2f}:1\n"
+                            f"Qty: {result['qty']:.4f}\n"
+                            f"Order ID: {result['order_id']}"
+                        )
+                        await send_telegram_report(success_msg, chat_id)
+                    else:
+                        reason = "ไม่พบ setup Counter-Trend ที่ผ่านเกณฑ์ (อาจ RR ต่ำ / แนวโน้มไม่แรงพอ)"
+                        await send_telegram_report(f"⚠️ {reason}\nลองใหม่ในภายหลังหรือเช็คด้วย /analyze {sym_input}", chat_id)
+
+                except Exception as e:
+                    error_msg = f"❌ เกิดข้อผิดพลาดขณะเข้า Counter-Trend {sym_input}: {str(e)}"
+                    await send_telegram_report(error_msg, chat_id)
+                    print(f"{Fore.RED}{error_msg}{Style.RESET_ALL}")
 
             # ===================== /fastscan =====================
             elif text == '/fastscan':
@@ -4799,6 +5073,8 @@ async def main():
                     f"⭐ `/positions` - All open positions\n"
                     f"/help - Full command list\n\n"
                     f"_Status: Ready to trade_ ✅\n"
+                    f"พิมพ์ /ctai btc หรือ /ctai avax Countertrend เพื่อวิเคราะห์เหรียญแบบละเอียดด้วย AI\n\n"
+                    f"/lmauto -ชื่อเหรียญ คือคำสั่งเปิด/ปิดระบบ LMAuto (Long/Short Management Auto) สำหรับจัดการ SL/TP อัตโนมัติ\n\n"
                     f"_LFG!_ 🚀"
                 )
                 await send_telegram_report(greeting)
@@ -5666,6 +5942,318 @@ async def main():
     if client:
         await client.close_connection()
     print(f"{Fore.GREEN}Bot stopped successfully. Goodbye!")
+
+
+# ==========================================================================
+#             COUNTER-TREND LIMIT ORDER PLACER (Long/Short) - Adjusted
+# ==========================================================================
+
+async def place_counter_trend_limit(client, symbol, analysis_data, risk_usdt=0.50, min_rr=1.5):
+    """
+    วาง Limit Order แบบ Counter-Trend โดยใช้ analysis_data ที่ส่งมา
+    """
+    try:
+        sym = symbol if symbol.endswith('USDT') else symbol + 'USDT'
+        
+        if not analysis_data:
+            print(f"[Counter-Trend] ไม่มี analysis_data สำหรับ {sym}")
+            return None
+        
+        current_price = analysis_data.get('price_current', 0)
+        if current_price <= 0:
+            print(f"[Counter-Trend] ราคาปัจจุบันไม่ถูกต้องสำหรับ {sym}")
+            return None
+        
+        # ตรวจแนวโน้ม (ตามตัวอย่าง AVAX: Bearish → Long)
+        trend_strong = False
+        direction = None
+        
+        if (analysis_data.get('trend_4h') == 'Bearish' and 
+            analysis_data.get('trend_1h') == 'Bearish'):
+            trend_strong = True
+            direction = 'LONG'
+            side_order = SIDE_BUY
+        
+        elif (analysis_data.get('trend_4h') == 'Bullish' and 
+              analysis_data.get('trend_1h') == 'Bullish'):
+            trend_strong = True
+            direction = 'SHORT'
+            side_order = SIDE_SELL
+        
+        if not trend_strong:
+            print(f"[Counter-Trend] แนวโน้มไม่แรงพอสำหรับ Counter {sym}")
+            return None
+        
+        # กำหนด Limit Price (ตามตัวอย่าง AVAX → ใช้ Support)
+        atr = analysis_data.get('atr', current_price * 0.015)
+        support = analysis_data.get('support', current_price * 0.97)
+        resistance = analysis_data.get('resistance', current_price * 1.03)
+        fib_382 = analysis_data.get('fib_382', current_price * 0.382)
+        fib_618 = analysis_data.get('fib_618', current_price * 0.618)
+        
+        limit_price_raw = 0.0
+        
+        if direction == 'LONG':
+            candidates = [support, fib_618, current_price - atr * 1.2]
+            limit_price_raw = min([x for x in candidates if x > 0])
+            if limit_price_raw < current_price * 0.92:
+                limit_price_raw = current_price * 0.94
+        
+        else:
+            candidates = [resistance, fib_382, current_price + atr * 1.2]
+            limit_price_raw = max([x for x in candidates if x > 0])
+            if limit_price_raw > current_price * 1.08:
+                limit_price_raw = current_price * 1.06
+        
+        if limit_price_raw <= 0:
+            return None
+        
+        # SL / TP
+        if direction == 'LONG':
+            sl_raw = limit_price_raw - atr * ATR_SL_MULTIPLIER
+            tp_raw = limit_price_raw + atr * ATR_TP_MULTIPLIER
+            tp_raw = min(tp_raw, resistance)
+        else:
+            sl_raw = limit_price_raw + atr * ATR_SL_MULTIPLIER
+            tp_raw = limit_price_raw - atr * ATR_TP_MULTIPLIER
+            tp_raw = max(tp_raw, support)
+        
+        rr = calculate_rr_ratio(limit_price_raw, sl_raw, tp_raw, direction)
+        if rr < min_rr:
+            print(f"[Counter-Trend] RR ต่ำเกิน {rr:.2f} < {min_rr} สำหรับ {sym}")
+            return None
+        
+        # Position sizing
+        stop_distance = abs(limit_price_raw - sl_raw)
+        position_value = risk_usdt / (stop_distance / limit_price_raw)
+        qty = position_value / limit_price_raw
+        
+        step_size = sym_filters.get(sym, {}).get('stepSize', 0.001)
+        qty = math.floor(qty / step_size) * step_size
+        if qty < step_size * 5:
+            qty = step_size * 5
+        
+        qty_precision = sym_info.get(sym, (4, 2))[1]
+        qty_str = f"{qty:.{qty_precision}f}"
+        
+        # ปัดราคา
+        tick_size = sym_filters.get(sym, {}).get('tickSize', 0.0001)
+        price_precision = sym_info.get(sym, (4, 2))[0]
+        limit_price = round_to_tick(limit_price_raw, tick_size)
+        sl_price = round_to_tick(sl_raw, tick_size)
+        tp_price = round_to_tick(tp_raw, tick_size)
+        
+        limit_str = f"{limit_price:.{price_precision}f}"
+        sl_str = f"{sl_price:.{price_precision}f}"
+        tp_str = f"{tp_price:.{price_precision}f}"
+        
+        # Leverage ตามตัวอย่าง
+        leverage = MAX_LEVERAGE
+        await client.futures_change_leverage(symbol=sym, leverage=leverage)
+        
+        # สั่ง Limit + SL/TP (เหมือนเดิม)
+        order = await client.futures_create_order(
+            symbol=sym,
+            side=side_order,
+            type='LIMIT',
+            timeInForce='GTC',
+            quantity=qty_str,
+            price=limit_str
+        )
+        
+        close_side = SIDE_SELL if direction == 'LONG' else SIDE_BUY
+        await client.futures_create_order(
+            symbol=sym,
+            side=close_side,
+            type='STOP_MARKET',
+            stopPrice=sl_str,
+            closePosition=True,
+            timeInForce='GTC',
+            workingType='MARK_PRICE',
+            reduceOnly=True
+        )
+        await client.futures_create_order(
+            symbol=sym,
+            side=close_side,
+            type='TAKE_PROFIT_MARKET',
+            stopPrice=tp_str,
+            closePosition=True,
+            timeInForce='GTC',
+            workingType='MARK_PRICE',
+            reduceOnly=True
+        )
+        
+        # บันทึก pending
+        pending_orders_detail.append({
+            'symbol': sym,
+            'side': side_order,
+            'price': limit_price,
+            'qty': qty,
+            'time': datetime.now(),
+            'orderId': order['orderId'],
+            'manual': False,
+            'leverage': leverage,
+            'risk_usdt': risk_usdt,
+            'source': 'counter_trend_auto'
+        })
+        
+        # รายงาน Telegram (ปรับให้เหมือนตัวอย่าง AVAX มากที่สุด)
+        report = f"📊 **{sym_input}/USDT - วิเคราะห์อัจฉริยะ**\n" \
+                 f"{datetime.now().strftime('%d/%m %H:%M')} | ราคา: {current_price:.2f}\n\n" \
+                 f"📈 Trend Analysis\n" \
+                 f"4H: {'🔴 Bearish' if analysis_data['trend_4h'] == 'Bearish' else '🟢 Bullish'}\n" \
+                 f"1H: {'🔴 Bearish' if analysis_data['trend_1h'] == 'Bearish' else '🟢 Bullish'}\n\n" \
+                 f"📊 Momentum\n" \
+                 f"RSI(4H): {analysis_data['rsi_4h']:.1f} Neutral\n" \
+                 f"Stoch(4H): {analysis_data['stoch_4h']:.1f} | Stoch(1H): {analysis_data['stoch_1h']:.1f}\n" \
+                 f"MACD: {'🔴 Bearish' if analysis_data['macd'] == 'Bearish' else '🟢 Bullish'}\n\n" \
+                 f"🎯 Support & Resistance\n" \
+                 f"Support: {analysis_data['support']:.2f} | Resistance: {analysis_data['resistance']:.2f}\n" \
+                 f"Position: Mid-range\n\n" \
+                 f"🎪 Fibonacci Levels (38.2%/61.8%: {analysis_data['fib_382']:.2f} / {analysis_data['fib_618']:.2f})\n\n" \
+                 f"💡 สรุป: {'Strong BUY 🟢' if direction == 'LONG' else 'Strong SELL 🔴'}\n\n" \
+                 f"✅ **ตั้ง Limit Order สำเร็จ!**\n" \
+                 f"เหรียญ: {sym_input}\n" \
+                 f"ทิศทาง: {direction} ({'Buy' if direction == 'LONG' else 'Sell'})\n" \
+                 f"ราคา Limit: `{limit_str}`\n" \
+                 f"Qty: `{qty_str}`\n" \
+                 f"เลเวอเรจ: `{leverage}x`\n" \
+                 f"Risk: `${risk_usdt:.2f}` USDT\n" \
+                 f"RR (โดยประมาณ): `{rr:.2f}:1`\n" \
+                 f"ราคาปัจจุบัน: `{current_price:.4f}`\n" \
+                 f"ATR: `{atr:.6f}`\n" \
+                 f"Order ID: `{order['orderId']}`"
+        
+        await send_telegram_report(report)
+        
+        return {'success': True, 'limit_price': limit_price, 'rr': rr}
+    
+    except Exception as e:
+        print(f"[Counter-Trend] Error {sym}: {e}")
+        return None
+
+
+# ==========================================================================
+#                  /lmauto - Limit Auto (ICT / Smart Money Advanced)
+# ==========================================================================
+
+async def analyze_ict_smart_money(client, sym, tf_main='1h', tf_higher='4h'):
+    """
+    วิเคราะห์ 8 เงื่อนไข ICT ขั้นสูง
+    Returns dict ของ confluence ที่เจอ + score
+    """
+    try:
+        # ดึงข้อมูลหลัก
+        k_main = await client.futures_klines(symbol=sym, interval=tf_main, limit=200)
+        df_main = calculate_indicators(k_main)
+        if df_main.empty: return None
+
+        k_higher = await client.futures_klines(symbol=sym, interval=tf_higher, limit=100)
+        df_higher = calculate_indicators(k_higher)
+
+        curr_main = df_main.iloc[-1]
+        prev_main = df_main.iloc[-2] if len(df_main) > 1 else curr_main
+
+        curr_higher = df_higher.iloc[-1] if not df_higher.empty else curr_main
+
+        current_price = float(curr_main['c'])
+        atr = float(curr_main['atr']) if 'atr' in curr_main else current_price * 0.015
+
+        confluence = {}
+        score = 0
+
+        # 1. Liquidity & Stop Hunting (Wick ยาว + เด้งกลับ)
+        wick_upper = curr_main['h'] - max(curr_main['o'], curr_main['c'])
+        wick_lower = min(curr_main['o'], curr_main['c']) - curr_main['l']
+        body = abs(curr_main['o'] - curr_main['c'])
+
+        is_stop_hunt_up = (wick_upper > body * 3) and (curr_main['c'] > curr_main['o'])
+        is_stop_hunt_down = (wick_lower > body * 3) and (curr_main['c'] < curr_main['o'])
+
+        if is_stop_hunt_up or is_stop_hunt_down:
+            confluence['liquidity_sweep'] = True
+            score += 2
+            confluence['sweep_direction'] = 'up' if is_stop_hunt_up else 'down'
+
+        # 2. Order Block (OB ที่ทำ BOS)
+        # หา OB ล่าสุด (แท่ง impulsive ก่อน BOS)
+        bos_detected = False
+        ob_level = 0.0
+        for i in range(-10, -1):
+            if df_main.iloc[i]['c'] > df_main.iloc[i]['ema50'] and df_main.iloc[i+1]['c'] < df_main.iloc[i+1]['ema50']:
+                bos_detected = True
+                ob_level = df_main.iloc[i]['h']  # High ของแท่งก่อน BOS (สำหรับ Short)
+                break
+            elif df_main.iloc[i]['c'] < df_main.iloc[i]['ema50'] and df_main.iloc[i+1]['c'] > df_main.iloc[i+1]['ema50']:
+                bos_detected = True
+                ob_level = df_main.iloc[i]['l']  # Low ของแท่งก่อน BOS (สำหรับ Long)
+                break
+
+        if bos_detected:
+            confluence['order_block'] = True
+            confluence['ob_level'] = ob_level
+            score += 2
+
+        # 3. Market Structure Shift (MSS) บน TF เล็ก
+        recent_highs = df_main['h'].iloc[-5:].max()
+        recent_lows = df_main['l'].iloc[-5:].min()
+        is_mss_long = (recent_lows > df_main['l'].iloc[-10] and recent_highs > df_main['h'].iloc[-10])
+        is_mss_short = (recent_highs < df_main['h'].iloc[-10] and recent_lows < df_main['l'].iloc[-10])
+
+        if is_mss_long or is_mss_short:
+            confluence['mss'] = True
+            confluence['mss_direction'] = 'long' if is_mss_long else 'short'
+            score += 1.5
+
+        # 4. Fair Value Gap (FVG)
+        fvg_up = (df_main['l'].shift(-1) > df_main['h']) & (df_main['c'] > df_main['o'])
+        fvg_down = (df_main['h'].shift(-1) < df_main['l']) & (df_main['c'] < df_main['o'])
+        latest_fvg = None
+        if fvg_up.any():
+            idx = fvg_up[fvg_up].index[-1]
+            latest_fvg = (df_main.loc[idx, 'h'], df_main.loc[idx, 'l'].shift(-1))
+        elif fvg_down.any():
+            idx = fvg_down[fvg_down].index[-1]
+            latest_fvg = (df_main.loc[idx, 'l'], df_main.loc[idx, 'h'].shift(-1))
+
+        if latest_fvg:
+            confluence['fvg'] = True
+            confluence['fvg_mid'] = (latest_fvg[0] + latest_fvg[1]) / 2
+            score += 1.5
+
+        # 5. Time-Based (Kill Zone / Session Open)
+        now_hour = datetime.now().hour
+        is_kill_zone = (now_hour in [8,9,10,14,15,16,20,21])  # London/NY open + kill zone ICT
+        if is_kill_zone:
+            confluence['kill_zone'] = True
+            score += 1
+
+        # 6. Volume Spike + Exhaustion
+        vol_spike = curr_main['v'] > curr_main['vol_ma'] * 2.0
+        vol_exhaust = (curr_main['v'] < curr_main['vol_ma'] * 0.6) and (abs(curr_main['c'] - curr_main['o']) > atr * 1.5)
+        if vol_spike or vol_exhaust:
+            confluence['volume_confirm'] = True
+            score += 1
+
+        # 7. Structure Divergence
+        if len(df_main) > 10:
+            hh_price = df_main['h'].iloc[-3:].max()
+            hh_idx = df_main['h'].iloc[-3:].idxmax()
+            if hh_price > df_main['h'].iloc[-6:hh_idx].max() and curr_main['adx'] < df_main['adx'].iloc[hh_idx-3]:
+                confluence['structure_div'] = True
+                score += 1.5
+
+        # 8. Confluence สรุป
+        confluence['total_score'] = score
+        confluence['direction'] = 'long' if score > 4 and ('mss' in confluence and confluence.get('mss_direction') == 'long') else \
+                                 'short' if score > 4 and ('mss' in confluence and confluence.get('mss_direction') == 'short') else None
+
+        return confluence if score >= 4 else None  # ต้อง ≥4 ข้อ (ตามที่คุณกำหนด ≥3 แต่เพิ่มความเข้มงวด)
+
+    except Exception as e:
+        print(f"ICT Analysis Error {sym}: {str(e)}")
+        await send_telegram_report(f"⚠️ ICT Analysis ล้มเหลว {sym_input}: {str(e)}", chat_id)
+        return None
 
 # ==========================================================================
 #                  ENTRY POINT
