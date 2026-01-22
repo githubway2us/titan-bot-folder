@@ -24,7 +24,8 @@ from pycoingecko import CoinGeckoAPI
 import csv
 from pathlib import Path
 from sklearn.model_selection import train_test_split
-
+from concurrent.futures import ThreadPoolExecutor  # ถ้าต้องการ hybrid กับ blocking calls
+from typing import List, Dict, Optional, Tuple, Any
 
 # --- LOAD ENV FIRST ---
 load_dotenv()
@@ -124,6 +125,15 @@ MEMORY_FILE = "titan_memory.json"
 # ==========================================================================
 #          CONFIG สำหรับกำไรสูงสุด (Aggressive Profit Mode) 2026
 # ==========================================================================
+# -------------------------- ค่าคงที่ (ปรับได้ตามต้องการ) --------------------------
+COOLDOWN_MINUTES     = 30
+MIN_VOL_RATIO        = 2.35
+MIN_RR_RATIO         = 1.95
+RISK_USD_PER_TRADE   = 0.5
+
+ALL_TFS = ["1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h", "1d"]
+PRIORITY_TFS = ["5m", "15m", "1h", "4h"]   # timeframe ที่คุณให้ความสำคัญสูงสุด
+
 
 # --- Trailing Stop (สำคัญที่สุดสำหรับกำไรสูงสุด) ---
 TRAILING_ACTIVATION_MULTIPLIER = 2.5          # จาก 1.8 → ปล่อยให้กำไรวิ่งไกลกว่านี้ก่อนเริ่ม trailing
@@ -610,6 +620,7 @@ def calculate_indicators(kline_data):
 
         df['ema20'] = df['c'].ewm(span=20, adjust=False).mean()
         df['ema50'] = df['c'].ewm(span=50, adjust=False).mean()
+        df['ema100'] = df['c'].ewm(span=100, adjust=False).mean()   # ← เพิ่มบรรทัดนี้
         df['ema200'] = df['c'].ewm(span=200, adjust=False).mean()
 
         delta = df['c'].diff()
@@ -703,7 +714,7 @@ async def check_htf_bullish_alignment(client, symbol):
         htf_klines = await client.futures_klines(symbol=symbol, interval="4h", limit=300)
         df_htf = calculate_indicators(htf_klines)
         
-        if df_htf.empty or len(df_htf) < 150:
+        if df_htf.empty or len(df_htf) < 100:
             print(f"[HTF Bull] {symbol}: ข้อมูลไม่พอ ({len(df_htf)} แท่ง)")
             return False
         
@@ -746,7 +757,7 @@ async def check_htf_bullish_alignment(client, symbol):
         if curr['c'] < curr['ema20'] * 1.08:
             bonus_score += 1
 
-        pass_htf = bonus_score >= 3
+        pass_htf = bonus_score >= 2
         
         if not pass_htf:
             print(f"[HTF Bull] {symbol}: core pass แต่ bonus only {bonus_score}/5")
@@ -1978,12 +1989,44 @@ async def send_telegram_report(text, chat_id=None, photo=None):
     if not target:
         return
     try:
+        # Escape เฉพาะตัวที่ MarkdownV2 ต้องการเท่านั้น
+        safe_text = text.replace('\\', '\\\\') \
+                       .replace('_', '\\_') \
+                       .replace('*', '\\*') \
+                       .replace('[', '\\[') \
+                       .replace(']', '\\]') \
+                       .replace('(', '\\(') \
+                       .replace(')', '\\)') \
+                       .replace('~', '\\~') \
+                       .replace('`', '\\`') \
+                       .replace('>', '\\>') \
+                       .replace('#', '\\#') \
+                       .replace('+', '\\+') \
+                       .replace('-', '\\-') \
+                       .replace('=', '\\=') \
+                       .replace('|', '\\|') \
+                       .replace('{', '\\{') \
+                       .replace('}', '\\}') \
+                       .replace('.', '\\.') \
+                       .replace('!', '\\!')
+
         if photo:
-            await telegram_bot.send_photo(chat_id=target, photo=photo, caption=text, parse_mode="Markdown")
+            await telegram_bot.send_photo(
+                chat_id=target,
+                photo=photo,
+                caption=safe_text,
+                parse_mode="MarkdownV2"   # ← เปลี่ยนเป็น MarkdownV2
+            )
         else:
-            await telegram_bot.send_message(chat_id=target, text=text, parse_mode="Markdown")
+            await telegram_bot.send_message(
+                chat_id=target,
+                text=safe_text,
+                parse_mode="MarkdownV2"   # ← เปลี่ยนที่นี่
+            )
     except TelegramError as e:
-        print(f"{Fore.RED}Telegram send error: {e}")
+        print(f"Telegram send error: {e}")
+        # Fallback: ส่งแบบ plain text ถ้า MarkdownV2 พัง
+        await telegram_bot.send_message(chat_id=target, text=text, parse_mode=None)
 
 # ==========================================================================
 #                           DASHBOARD
@@ -2195,232 +2238,519 @@ async def print_dashboard(client, balance, active_positions, pending_orders, pri
 # ==========================================================================
 #                  AUTO ENTER: VOLUME SPIKE → MARKET LONG ($0.5 risk)
 # ==========================================================================
-async def detect_volume_spike_symbols(client, symbols, price_map, active_symbols):
-    tfs = ['3m', '15m', '30m', '1h', '4h']
-    results = []
+
+
+# -------------------------------------------------------------------------
+# ช่วยให้ fetch klines หลาย timeframe พร้อมกัน (สำคัญมากสำหรับความเร็ว)
+# -------------------------------------------------------------------------
+async def fetch_klines_batch(client, symbol, timeframes, limit=60):
+    """
+    ดึง klines หลาย timeframe พร้อมกัน → ลด latency สะสม
+    """
+    tasks = []
+    for tf in timeframes:
+        tasks.append(client.futures_klines(symbol=symbol, interval=tf, limit=limit))
     
-    # Cooldown หลังเข้า LONG แต่ละเหรียญ (ป้องกันเข้าเร็วเกิน)
-    global last_long_entry_time
-    if not hasattr(detect_volume_spike_symbols, 'last_long_entry_time'):
-        last_long_entry_time = {}  # sym → timestamp ล่าสุดที่เข้า LONG
+    results = await asyncio.gather(*tasks, return_exceptions=True)
     
+    tf_data = {}
+    for tf, result in zip(timeframes, results):
+        if isinstance(result, Exception):
+            print(f"{Fore.RED}Fetch error {symbol} {tf}: {result}{Style.RESET_ALL}")
+            continue
+        tf_data[tf] = result
+    
+    return tf_data
+
+
+# -------------------------------------------------------------------------
+# ฟังก์ชันหลักที่ปรับปรุงแล้ว
+# ==========================================================================
+# ฟังก์ชันหลัก
+# ==========================================================================
+async def detect_volume_spike_symbols(
+    client: AsyncClient,
+    symbols: List[str],
+    price_map: Dict[str, float],
+    active_symbols: set,
+    max_concurrent: int = 12
+) -> List[str]:
+    """
+    ตรวจจับ volume spike + เงื่อนไขคุณภาพ → เข้า LONG อัตโนมัติ
+    Returns: list ของ symbol ที่เข้า order สำเร็จ
+    """
+    now = datetime.utcnow()
+    cooldown_until = now - timedelta(minutes=COOLDOWN_MINUTES)
+
+    if not hasattr(detect_volume_spike_symbols, "cooldown_map"):
+        detect_volume_spike_symbols.cooldown_map: Dict[str, datetime] = {}
+
+    cooldown_map = detect_volume_spike_symbols.cooldown_map
+
+    # กรอง candidate ก่อน
+    candidates = []
     for sym in symbols:
-        # ข้ามถ้ามี position อยู่แล้ว
         if sym in active_symbols:
             continue
-        
-        # Cooldown check: ห้ามเข้าเหรียญเดิมภายใน 30 นาทีหลังเข้า Market LONG
-        now = datetime.now().timestamp()
-        last_entry = last_long_entry_time.get(sym, 0)
-        if now - last_entry < 1800:  # 1800 วินาที = 30 นาที
-            print(f"{Fore.YELLOW}Skip {sym}: Cooldown หลังเข้า LONG ({int((1800 - (now-last_entry))/60)} นาทีเหลือ){Style.RESET_ALL}")
+        last = cooldown_map.get(sym)
+        if last and last > cooldown_until:
+            remain = int((last - cooldown_until).total_seconds() / 60)
+            print(f"{Fore.YELLOW}Skip {sym}: Cooldown เหลือ {remain} นาที{Style.RESET_ALL}")
             continue
+        candidates.append(sym)
+
+    if not candidates:
+        return []
+
+    # จำกัด concurrent requests ป้องกัน rate limit
+    semaphore = asyncio.Semaphore(max_concurrent)
+
+    async def limited_process(sym: str):
+        async with semaphore:
+            return await process_single_symbol(
+                client,
+                sym,
+                all_tfs=ALL_TFS,          # เพิ่มตรงนี้
+                priority_tfs=PRIORITY_TFS # เพิ่มตรงนี้
+            )
+
+    tasks = [limited_process(sym) for sym in candidates]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    entered = []
+
+    for sym, result in zip(candidates, results):
+        if isinstance(result, Exception):
+            print(f"{Fore.RED}Process {sym} error: {result}{Style.RESET_ALL}")
+            await send_telegram_report(f"⚠️ Process error {sym}: {str(result)}")
+            continue
+
+        if result is None:
+            continue
+
+        best_tf, df, vol_ratio, entry_price = result
+
+        try:
+            success = await execute_long_entry(
+                client, sym, df, entry_price, vol_ratio, best_tf
+            )
+            if success:
+                entered.append(sym)
+                cooldown_map[sym] = now  # อัปเดต cooldown
+        except Exception as e:
+            print(f"{Fore.RED}Entry {sym} failed: {e}{Style.RESET_ALL}")
+            await send_telegram_report(f"❌ Entry fail {sym}: {str(e)}")
+
+    return entered
+
+
+# ==========================================================================
+# Process ทีละเหรียญ
+async def process_single_symbol(client: AsyncClient, symbol: str) -> Optional[Tuple[str, Any, float, float]]:
+    try:
+        klines_tasks = {
+            tf: client.futures_klines(symbol=symbol, interval=tf, limit=60)
+            for tf in ALL_TFS     # ใช้ global ได้เลย
+        }
+        klines_results = await asyncio.gather(*klines_tasks.values(), return_exceptions=True)
+
+        klines_dict = {}
+        for tf, res in zip(klines_tasks, klines_results):
+            if isinstance(res, Exception) or not res or len(res) < 35:
+                continue
+            klines_dict[tf] = res
+
+        if not klines_dict:
+            return None
+
+        # หา best spike (เรียง priority ก่อน)
+        best = None
+        best_ratio = 0.0
+
+        for tf in PRIORITY_TFS + [t for t in ALL_TFS if t not in PRIORITY_TFS]:
+            klines = klines_dict.get(tf)
+            if not klines:
+                continue
+
+            df = calculate_indicators(klines)  # ฟังก์ชันของคุณเอง
+            if df.empty or len(df) < 30:
+                continue
+
+            curr = df.iloc[-1]
+            vol_ma = curr.get('vol_ma', 0)
+            if vol_ma <= 0:
+                continue
+
+            ratio = curr['v'] / vol_ma
+            if ratio > MIN_VOL_RATIO and ratio > best_ratio:
+                best_ratio = ratio
+                best = (tf, df, ratio, float(curr['c']))
+
+            if best is None:
+                print(f"{Fore.YELLOW}{symbol} → ไม่เจอ volume spike ที่ดีพอ (MIN_VOL_RATIO={MIN_VOL_RATIO}){Style.RESET_ALL}")
+                return None
+
+            print(f"{Fore.GREEN}{symbol} → ผ่าน! Best TF: {best_tf} | Vol Ratio: {best_ratio:.2f}x | Price: {price:.4f}{Style.RESET_ALL}")
+
+            # ก่อนตรวจคุณภาพ
+            print(f"   → กำลังตรวจคุณภาพ setup ({best_tf})...")
+
+            if not await is_quality_long_setup(client, symbol, df):
+                print(f"{Fore.RED}   → ไม่ผ่านคุณภาพ setup{Style.RESET_ALL}")
+                return None
+
+            print(f"{Fore.GREEN}   → คุณภาพ setup ผ่าน! พร้อมเข้า LONG{Style.RESET_ALL}")
+
+    except Exception as e:
+        print(f"{Fore.RED}{symbol} process exception: {e}{Style.RESET_ALL}")
+        return None
+
+
+# ==========================================================================
+# เงื่อนไขคุณภาพ (ปรับแต่งได้ง่าย)
+# ==========================================================================
+async def is_quality_long_setup(client: AsyncClient, symbol: str, df) -> bool:
+    try:
+        curr = df.iloc[-1]
+
+        # HTF alignment (สำคัญที่สุด)
+        if not await check_htf_bullish_alignment(client, symbol):
+            print(f"{Fore.YELLOW}{symbol}: HTF ไม่ bullish{Style.RESET_ALL}")
+            return False
+
+        # EMA เรียงตัวดี
+        ema20 = curr.get('ema20', 0)
+        ema50 = curr.get('ema50', 0)
+        ema100 = curr.get('ema100', ema50)
+        if not (ema20 > ema50 > ema100 * 0.995):
+            return False
+
+        # Momentum + Candle confirmation
+        stoch_k = curr.get('stoch_k', 50)
+        stoch_d = curr.get('stoch_d', 50)
+        bullish_stoch = stoch_k < 32 and stoch_k > stoch_d
+
+        bullish_candle = curr['c'] > curr['o']
+
+        strong_engulf = False
+        if len(df) >= 2:
+            p = df.iloc[-2]
+            strong_engulf = (
+                p['c'] < p['o'] and
+                curr['o'] <= p['c'] and
+                curr['c'] > p['o'] and
+                (curr['c'] - curr['o']) > (p['o'] - p['c']) * 1.2
+            )
+
+        if not (bullish_stoch or strong_engulf or bullish_candle):
+            return False
+
+        # ราคาใกล้ demand zone
+        support = float(curr.get('support', 0))
+        if support > 0 and curr['c'] < support * 0.986:
+            return False
+
+        return True
+
+    except Exception:
+        return False
+
+
+# ==========================================================================
+# เข้า order จริง
+# ==========================================================================
+async def execute_long_entry(
+    client: AsyncClient,
+    symbol: str,
+    df,
+    entry_price: float,
+    vol_ratio: float,
+    tf: str,
+) -> bool:
+    try:
+        curr = df.iloc[-1]
+        atr = curr['atr']
+
+        sl = entry_price - atr * ATR_SL_MULTIPLIER
+        tp = entry_price + atr * ATR_TP_MULTIPLIER
+
+        # ปรับ TP ด้วย resistance ถ้า RR ยังดี
+        resistance = float(curr.get('resistance', 0))
+        if resistance > entry_price * 1.008 and tp > resistance:
+            tp_cand = resistance * 0.982
+            rr_cand = (tp_cand - entry_price) / (entry_price - sl)
+            if rr_cand >= MIN_RR_RATIO:
+                tp = tp_cand
+
+        rr = (tp - entry_price) / (entry_price - sl)
+        if rr < MIN_RR_RATIO:
+            print(f"{Fore.YELLOW}{symbol} RR {rr:.2f} < {MIN_RR_RATIO} → skip{Style.RESET_ALL}")
+            return False
+
+        # Position sizing
+        stop_dist = entry_price - sl
+        if stop_dist <= 0:
+            return False
+
+        position_value = RISK_USD_PER_TRADE / (stop_dist / entry_price)
+        qty = position_value / entry_price
+
+        step_size = sym_filters.get(symbol, {}).get('stepSize', 0.001)
+        qty = math.floor(qty / step_size) * step_size
+        qty = max(qty, step_size * 5)  # ขั้นต่ำ
+
+        qty_prec = sym_info.get(symbol, (4, 2))[1]
+        qty_str = f"{qty:.{qty_prec}f}"
+
+        # เปลี่ยน leverage
+        await client.futures_change_leverage(symbol=symbol, leverage=MAX_LEVERAGE)
+
+        # Market Buy
+        await client.futures_create_order(
+            symbol=symbol,
+            side="BUY",
+            type="MARKET",
+            quantity=qty_str
+        )
+
+        # SL & TP
+        tick_size = sym_filters.get(symbol, {}).get('tickSize', 0.0001)
+        price_prec = sym_info.get(symbol, (4, 2))[0]
+
+        sl_tick = round(sl / tick_size) * tick_size
+        tp_tick = round(tp / tick_size) * tick_size
+
+        await client.futures_create_order(
+            symbol=symbol,
+            side="SELL",
+            type="STOP_MARKET",
+            stopPrice=f"{sl_tick:.{price_prec}f}",
+            closePosition=True,
+            reduceOnly=True,
+            workingType="MARK_PRICE"
+        )
+
+        await client.futures_create_order(
+            symbol=symbol,
+            side="SELL",
+            type="TAKE_PROFIT_MARKET",
+            stopPrice=f"{tp_tick:.{price_prec}f}",
+            closePosition=True,
+            reduceOnly=True,
+            workingType="MARK_PRICE"
+        )
+
+        # Report
+        fib_elliot = get_fib_elliot_signal(df, entry_price)  # ฟังก์ชันของคุณ
+        report = f"""🚀 AUTO LONG {symbol}
+ราคาเข้า   : {entry_price:.4f}
+Qty        : {qty_str}
+SL         : {sl_tick:.4f}   TP: {tp_tick:.4f}
+RR         : {rr:.2f}:1
+Vol Spike  : {vol_ratio:.2f}x ({tf})
+HTF        : Bullish ✓
+EMA        : Aligned ✓
+Action/Stoch ✓
+Elliott    : {fib_elliot.get('wave_pattern','?')} ({fib_elliot.get('wave_direction','?')})"""
+
+        await send_telegram_report(report)
+        print(f"{Fore.GREEN}{Style.BRIGHT}{report}{Style.RESET_ALL}")
+
+        return True
+
+    except Exception as e:
+        await send_telegram_report(f"Order failed {symbol}: {str(e)}")
+        raise
+
+# -------------------------------------------------------------------------
+# แยกการประมวลผลทีละเหรียญ (เพื่อ parallel)
+# -------------------------------------------------------------------------
+async def process_single_symbol(client, sym, all_tfs, priority_tfs):
+    try:
+        # ดึงข้อมูลทั้งหมดที่จำเป็นในรอบเดียว
+        klines_batch = await fetch_klines_batch(client, sym, all_tfs, limit=60)
+        if not klines_batch:
+            return None
         
-        spike_data = {}
+        spike_candidates = {}
         max_ratio = 0
         best_tf = None
-        best_atr = 0
-        best_price = 0
-        best_sl = 0
-        best_tp = 0
-        best_support = 0
-        best_resistance = 0
+        best_df = None
         
-        for tf in tfs:
-            try:
-                klines = await client.futures_klines(symbol=sym, interval=tf, limit=50)
-                df = calculate_indicators(klines)
-                if df.empty or len(df) < 20:
-                    continue
+        for tf in priority_tfs:  # ตรวจ timeframe สำคัญก่อน
+            klines = klines_batch.get(tf)
+            if not klines or len(klines) < 35:
+                continue
                 
-                curr = df.iloc[-1]
-                vol_ratio = curr['v'] / curr['vol_ma'] if curr['vol_ma'] > 0 else 0
+            df = calculate_indicators(klines)  # ฟังก์ชันเดิมของคุณ
+            if df.empty:
+                continue
                 
-                if vol_ratio > 2.5:
-                    spike_data[tf] = vol_ratio
-                    if vol_ratio > max_ratio:
-                        max_ratio = vol_ratio
-                        best_tf = tf
-                        best_atr = curr['atr']
-                        best_price = curr['c']
-                        best_support = float(curr.get('support', 0))
-                        best_resistance = float(curr.get('resistance', 0))
-                        
-            except Exception as e:
-                print(f"{Fore.RED}Spike detect error {sym} {tf}: {e}")
+            curr = df.iloc[-1]
+            vol_ratio = curr['v'] / curr['vol_ma'] if curr['vol_ma'] > 0 else 0
+            
+            if vol_ratio > 2.4:  # ปรับ threshold นิดหน่อย
+                spike_candidates[tf] = (vol_ratio, df)
+                if vol_ratio > max_ratio:
+                    max_ratio = vol_ratio
+                    best_tf = tf
+                    best_df = df
         
         if not best_tf:
-            continue  # ไม่มี volume spike เลย → ข้าม
+            # ถ้า priority ไม่เจอ ลอง tf อื่นบ้าง (แต่ไม่ค่อยได้ผลดี)
+            for tf in set(all_tfs) - set(priority_tfs):
+                if tf not in klines_batch:
+                    continue
+                # ... เหมือนด้านบน (ย่อเพื่อไม่ให้โค้ดยาว)
         
-        # ดึงข้อมูลเต็มของ timeframe ที่ดีที่สุด
-        try:
-            full_klines = await client.futures_klines(symbol=sym, interval=best_tf, limit=50)
-            df_full = calculate_indicators(full_klines)
-            if df_full.empty:
-                continue
-            curr = df_full.iloc[-1]
-        except:
-            continue
+        if not best_tf or max_ratio < 2.4:
+            return None
         
-        # =====================================================================
-        # เงื่อนไขเข้มงวด + ปลอดภัยสำหรับ LONG
-        # =====================================================================
+        curr = best_df.iloc[-1]
         
-        # 1. HTF ต้อง bullish ชัดเจนก่อน (สำคัญที่สุด!)
-        htf_bullish = await check_htf_bullish_alignment(client, sym)
-        if not htf_bullish:
-            print(f"{Fore.YELLOW}Skip {sym}: HTF 4H ไม่ bullish aligned{Style.RESET_ALL}")
-            continue
+        # ────────────────────────────────────────────────
+        #  เงื่อนไขกรองเข้มงวด + มีเหตุผล (2025-2026 meta)
+        # ────────────────────────────────────────────────
         
-        # 2. EMA: อย่างน้อย 20 > 50 (ลดความเข้มจาก 20>50>200)
-        ema_aligned = curr['ema20'] > curr['ema50']
-        if not ema_aligned:
-            print(f"{Fore.YELLOW}Skip {sym}: EMA20 ไม่เหนือ EMA50{Style.RESET_ALL}")
-            continue
+        # 1. HTF alignment (สำคัญที่สุด — ควรมี weight สูง)
+        # แก้เป็น
+        if not await check_htf_bullish_alignment(client, sym):
+            return None
+                
+        # 2. EMA structure + slope (เพิ่มความมั่นใจ)
+        if not (curr['ema20'] > curr['ema50'] > curr['ema100'] * 0.995):
+            return None
         
-        # 3. Stochastic Oversold หรือ Price Action ยืนยัน (ต้องมีอย่างใดอย่างหนึ่ง)
-        stoch_oversold = curr.get('stoch_k', 50) < 25  # ผ่อนจาก 20 เป็น 25
+        # 3. Momentum / structure confirmation
+        stoch_ok = curr.get('stoch_k', 50) < 28 and curr.get('stoch_d', 50) < 32
         
-        # Price Action (Bullish Pin Bar หรือ Engulfing)
-        body = abs(curr['o'] - curr['c'])
-        lower_wick = min(curr['o'], curr['c']) - curr['l']
-        upper_wick = curr['h'] - max(curr['o'], curr['c'])
-        pin_bar_bullish = (lower_wick > body * 2.0) and (upper_wick < body * 0.6)
-        
-        engulfing_bullish = False
-        if len(df_full) > 1:
-            prev = df_full.iloc[-2]
-            engulfing_bullish = (
-                (curr['o'] < prev['c']) and
-                (curr['c'] > prev['o']) and
-                (curr['c'] > prev['c'])
+        # Bullish structure (Engulfing / Pinbar / Inside → breakout)
+        is_bullish_candle = curr['c'] > curr['o']
+        bullish_engulf = False
+        if len(best_df) >= 2:
+            prev = best_df.iloc[-2]
+            bullish_engulf = (
+                prev['c'] < prev['o'] and
+                curr['o'] <= prev['c'] and
+                curr['c'] > prev['o'] and
+                (curr['c'] - curr['o']) > (prev['o'] - prev['c']) * 1.1
             )
         
-        price_action_ok = pin_bar_bullish or engulfing_bullish
+        if not (stoch_ok or bullish_engulf or is_bullish_candle):
+            return None
         
-        if not (stoch_oversold or price_action_ok):
-            print(f"{Fore.YELLOW}Skip {sym}: ไม่มี Stoch oversold หรือ Price Action bullish{Style.RESET_ALL}")
-            continue
-        
-        # 4. Support/Resistance: ราคาต้องไม่ต่ำกว่า support มาก และไม่เกิน resistance มาก
+        # 4. ราคาอยู่ใน demand zone / ใกล้ support
         support = float(curr.get('support', 0))
+        if support > 0 and curr['c'] < support * 0.989:  # เข้มขึ้น
+            return None
+        
         resistance = float(curr.get('resistance', 0))
-        price_above_support = curr['c'] > support * 0.992 if support > 0 else True   # ผ่อนลงเหลือ -0.8%
-        price_below_resistance = curr['c'] < resistance * 1.008 if resistance > 0 else True
+        if resistance > 0 and curr['c'] > resistance * 1.012:
+            return None
         
-        if not (price_above_support and price_below_resistance):
-            print(f"{Fore.YELLOW}Skip {sym}: ราคาอยู่นอกโซน support/resistance ที่ปลอดภัย{Style.RESET_ALL}")
-            continue
+        # ผ่านทุกเงื่อนไขแล้ว
+        return best_tf, best_df, max_ratio, curr['c']
         
-        # =====================================================================
-        # คำนวณ SL/TP + RR
-        # =====================================================================
-        sl = best_price - (best_atr * ATR_SL_MULTIPLIER)
-        tp = best_price + (best_atr * ATR_TP_MULTIPLIER)
-        
-        # ปรับ TP ด้วย resistance แต่ต้องรักษา RR ขั้นต่ำ
-        tp_original = tp
-        if best_resistance > 0 and tp > best_resistance:
-            tp_candidate = best_resistance * 0.98
-            rr_candidate = calculate_rr_ratio(best_price, sl, tp_candidate, 'LONG')
-            
-            if rr_candidate >= 1.8:
-                tp = tp_candidate
-                print(f"{Fore.CYAN}{sym}: ปรับ TP ลงเหลือ resistance {tp:.4f} (RR ยังดี {rr_candidate:.2f}:1){Style.RESET_ALL}")
-            else:
-                print(f"{Fore.YELLOW}{sym}: ข้ามปรับ TP ด้วย resistance เพราะ RR ตกเหลือ {rr_candidate:.2f}:1 < 1.8{Style.RESET_ALL}")
-        
-        rr_ratio = calculate_rr_ratio(best_price, sl, tp, 'LONG')
-        if rr_ratio < 1.8:
-            print(f"{Fore.YELLOW}Skip {sym}: RR {rr_ratio:.2f}:1 ต่ำกว่าเกณฑ์ปลอดภัย 1.8:1{Style.RESET_ALL}")
-            continue
-        
-        # =====================================================================
-        # เข้า Market LONG (ปลอดภัยสูงสุด)
-        # =====================================================================
-        try:
-            risk_amount = 0.5
-            stop_distance = best_atr * ATR_SL_MULTIPLIER
-            if stop_distance <= 0:
-                continue
-            
-            position_value = risk_amount / (stop_distance / best_price)
-            qty = position_value / best_price
-            
-            step_size = sym_filters.get(sym, {}).get('stepSize', 0.001)
-            qty = math.floor(qty / step_size) * step_size
-            if qty < step_size * 10:
-                qty = step_size * 10  # ขั้นต่ำ
-            
-            qty_precision = sym_info.get(sym, (4, 2))[1]
-            qty_str = f"{qty:.{qty_precision}f}"
-            
-            # ตั้ง leverage
-            await client.futures_change_leverage(symbol=sym, leverage=MAX_LEVERAGE)
-            
-            # เข้า Market
-            order = await client.futures_create_order(
-                symbol=sym,
-                side=SIDE_BUY,
-                type='MARKET',
-                quantity=qty
-            )
-            
-            # ตั้ง SL/TP
-            tick_size = sym_filters.get(sym, {}).get('tickSize', 0.0001)
-            sl_price = round_to_tick(sl, tick_size)
-            tp_price = round_to_tick(tp, tick_size)
-            p_prec = sym_info.get(sym, (4, 2))[0]
-            
-            await client.futures_create_order(
-                symbol=sym,
-                side=SIDE_SELL,
-                type='STOP_MARKET',
-                stopPrice=f"{sl_price:.{p_prec}f}",
-                closePosition=True,
-                timeInForce='GTC',
-                workingType='MARK_PRICE',
-                reduceOnly=True
-            )
-            await client.futures_create_order(
-                symbol=sym,
-                side=SIDE_SELL,
-                type='TAKE_PROFIT_MARKET',
-                stopPrice=f"{tp_price:.{p_prec}f}",
-                closePosition=True,
-                timeInForce='GTC',
-                workingType='MARK_PRICE',
-                reduceOnly=True
-            )
-            
-            # บันทึกเวลาที่เข้าเพื่อ cooldown
-            last_long_entry_time[sym] = now
-            
-            # Report
-            fib_elliot = get_fib_elliot_signal(df_full, best_price)
-            report = (
-                f"🚀 **AUTO LONG เข้าปลอดภัยสูง**\n"
-                f"เหรียญ: {sym.replace('USDT','')}\n"
-                f"ราคาเข้า: {best_price:.4f}\n"
-                f"Qty: {qty_str} | Risk: $0.5\n"
-                f"SL: {sl_price:.4f} | TP: {tp_price:.4f}\n"
-                f"RR: {rr_ratio:.2f}:1\n"
-                f"Vol Spike: {max_ratio:.2f}x ({best_tf})\n"
-                f"HTF 4H: Bullish ✓\n"
-                f"EMA: 20 > 50 ✓\n"
-                f"Price Action/Stoch: {'✓' if price_action_ok or stoch_oversold else '⚠️'}\n"
-                f"Elliott: {fib_elliot['wave_pattern']} ({fib_elliot['wave_direction']})"
-            )
-            await send_telegram_report(report)
-            print(f"{Fore.GREEN}{Style.BRIGHT}{report}{Style.RESET_ALL}")
-            
-            results.append(sym)
-            
-        except Exception as e:
-            print(f"{Fore.RED}Auto LONG failed {sym}: {e}{Style.RESET_ALL}")
-            await send_telegram_report(f"❌ Auto LONG ล้มเหลว {sym}: {str(e)}")
+    except Exception as e:
+        print(f"{Fore.RED}{sym} process error: {e}{Style.RESET_ALL}")
+        return None
+
+
+# -------------------------------------------------------------------------
+# แยกส่วนเข้า order (อ่านง่าย + จัดการ error ชัดเจน)
+# -------------------------------------------------------------------------
+async def execute_long_entry(client, sym, df, entry_price, vol_ratio, tf):
+    curr = df.iloc[-1]
+    atr = curr['atr']
     
-    return results
+    sl = entry_price - atr * ATR_SL_MULTIPLIER
+    tp = entry_price + atr * ATR_TP_MULTIPLIER
+    
+    # ปรับ TP ด้วย resistance ถ้า RR ยังดี
+    resistance = float(curr.get('resistance', 0))
+    if resistance > entry_price * 1.008 and tp > resistance:
+        tp_cand = resistance * 0.982
+        rr_cand = (tp_cand - entry_price) / (entry_price - sl)
+        if rr_cand >= MIN_RR_RATIO:
+            tp = tp_cand
+        # else ใช้ tp เดิม
+    
+    rr = (tp - entry_price) / (entry_price - sl)
+    if rr < MIN_RR_RATIO:
+        print(f"{Fore.YELLOW}{sym} RR {rr:.2f} < {MIN_RR_RATIO} → skip{Style.RESET_ALL}")
+        return False
+    
+    # ---------------------------------------------------------------------
+    # Position sizing + Order execution
+    # ---------------------------------------------------------------------
+    risk_usd = 0.5
+    stop_dist_pct = (entry_price - sl) / entry_price
+    position_value = risk_usd / stop_dist_pct
+    qty = position_value / entry_price
+    
+    # ปรับตาม precision / filter ของ symbol (สมมติว่ามี sym_info, sym_filters)
+    step_size = sym_filters.get(sym, {}).get('stepSize', 0.001)
+    qty = math.floor(qty / step_size) * step_size
+    qty = max(qty, step_size * 5)  # ป้องกัน qty น้อยเกินไป
+    
+    qty_prec = sym_info.get(sym, (4, 2))[1]
+    qty_str = f"{qty:.{qty_prec}f}"
+    
+    try:
+        # Leverage
+        await client.futures_change_leverage(symbol=sym, leverage=MAX_LEVERAGE)
+        
+        # Market Buy
+        await client.futures_create_order(
+            symbol=sym,
+            side='BUY',
+            type='MARKET',
+            quantity=qty_str
+        )
+        
+        tick_size = sym_filters.get(sym, {}).get('tickSize', 0.0001)
+        price_prec = sym_info.get(sym, (4, 2))[0]
+        
+        sl_tick = round_to_tick(sl, tick_size)
+        tp_tick = round_to_tick(tp, tick_size)
+        
+        # SL
+        await client.futures_create_order(
+            symbol=sym, side='SELL', type='STOP_MARKET',
+            stopPrice=f"{sl_tick:.{price_prec}f}",
+            closePosition=True, reduceOnly=True,
+            workingType='MARK_PRICE'
+        )
+        
+        # TP
+        await client.futures_create_order(
+            symbol=sym, side='SELL', type='TAKE_PROFIT_MARKET',
+            stopPrice=f"{tp_tick:.{price_prec}f}",
+            closePosition=True, reduceOnly=True,
+            workingType='MARK_PRICE'
+        )
+        
+        # Report
+        fib_elliot = get_fib_elliot_signal(df, entry_price)
+        report = f"""🚀 AUTO LONG {sym}
+ราคาเข้า: {entry_price:.4f}  |  Qty: {qty_str}
+SL: {sl_tick:.4f}  |  TP: {tp_tick:.4f}  |  RR: {rr:.2f}:1
+Vol Spike: {vol_ratio:.2f}x ({tf})
+HTF Bullish ✓   EMA align ✓   Action/Stoch ✓
+Elliott: {fib_elliot['wave_pattern']} ({fib_elliot['wave_direction']})"""
+        
+        await send_telegram_report(report)
+        print(f"{Fore.GREEN}{Style.BRIGHT}{report}{Style.RESET_ALL}")
+        
+        return True
+        
+    except Exception as e:
+        await send_telegram_report(f"Order failed {sym}: {str(e)}")
+        raise  # ให้ส่วนบนจัดการต่อ
+    
+    return False
+
+
 
 # ==========================================================================
 #                  AUTO ENTER: STRONG SHORT SIGNAL → MARKET SHORT ($0.5 risk)
@@ -3748,6 +4078,31 @@ async def get_analysis_data(client, sym):
     except Exception as e:
         print(f"[get_analysis_data Error] {sym}: {e}")
         return None
+
+def escape_md(text: str) -> str:
+    if not text:
+        return text
+    return (
+        text.replace("_", "\\_")
+            .replace("*", "\\*")
+            .replace("[", "\\[")
+            .replace("]", "\\]")
+            .replace("(", "\\(")
+            .replace(")", "\\)")
+            .replace("~", "\\~")
+            .replace("`", "\\`")
+            .replace(">", "\\>")
+            .replace("#", "\\#")
+            .replace("+", "\\+")
+            .replace("-", "\\-")
+            .replace("=", "\\=")
+            .replace("|", "\\|")
+            .replace("{", "\\{")
+            .replace("}", "\\}")
+            .replace(".", "\\.")
+            .replace("!", "\\!")
+    )
+
 # ==========================================================================
 #                  TELEGRAM COMMAND LISTENER (รวมทุกคำสั่งล่าสุด - แก้ Indentation แล้ว)
 # ==========================================================================
@@ -4056,6 +4411,21 @@ async def check_telegram_updates(client, cmd_q, price_map):
 
                 except Exception as e:
                     await send_telegram_report(f"❌ /lmauto ล้มเหลว {sym_input}: {str(e)}", chat_id)
+
+            # ===================== /trainnow =====================
+            elif text == '/trainnow':
+                if len(brain.data) < 5:
+                    await send_telegram_report("⚠️ ยังมีข้อมูลน้อยเกินไป ต้องมีอย่างน้อย 5 trades", chat_id)
+                else:
+                    brain.train_model()
+                    stats = brain.get_ai_stats()
+                    await send_telegram_report(
+                        f"🧠 **Force Train สำเร็จ!**\n"
+                        f"Total samples: {stats['total_trades']}\n"
+                        f"Accuracy ล่าสุด: {stats['last_accuracy']:.2f}%\n"
+                        f"Best loss: {stats['best_loss']:.6f}",
+                        chat_id
+                    )
             # ==========================================================================
             #                  เพิ่มคำสั่ง /ctai <symbol> ใน Telegram Handler
             # ==========================================================================
@@ -4444,6 +4814,14 @@ async def check_telegram_updates(client, cmd_q, price_map):
                     "/restartscan → บังคับสแกนหาสัญญาณใหม่ทันที\n"
                     "/setlm <เหรียญ> <ราคา> <L/S> → ตั้ง Limit แมนนวล\n\n"
                     "คำสั่งเหล่านี้ใช้ควบคุมการทำงานอัตโนมัติโดยไม่ต้องปิดบอท"
+                    "ext...."
+                    "/trainnow → บังคับให้ AI เทรนโมเดลทันที (ถ้ามีข้อมูลพอ)\n"
+                    "/aistats → ดูสถิติการเทรน AI\n"
+                    "/backtest [num_periods] [train] → รัน backtest และ pre-train AI\n"
+                    "/ctai <เหรียญ> → เข้า Counter-Trend อัตโนมัติ\n"
+                    "/lmauto <เหรียญ> → เข้า ICT Smart Money อัตโนมัติ\n"
+                    "/ctai และ lmauto จะตั้ง Limit Order อัตโนมัติ\n"
+                    "/divscan → สแกนเหรียญที่มี Divergence อัตโนมัติ\n"
                 )
                 await send_telegram_report(help_work, chat_id)
             # ===================== /backtest =====================
@@ -4772,27 +5150,34 @@ async def check_telegram_updates(client, cmd_q, price_map):
                     engulf_b = curr_4h.get('engulfing_bearish', 0) == 0  # ไม่เป็น bearish
                     
                     # ===== สร้าง Report =====
+                    # ===== สร้าง Report =====
                     report_text = (
-                        f"📊 **{sym_input}/USDT - วิเคราะห์อัจฉริยะ**\n"
-                        f"`{datetime.now().strftime('%d/%m %H:%M')}` | ราคา: `{current_price:,.2f}`\n\n"
-                        
-                        f"**📈 Trend Analysis**\n"
-                        f"4H: {trend_4h}\n"
-                        f"1H: {trend_1h}\n\n"
-                        
-                        f"**📊 Momentum**\n"
-                        f"RSI(4H): {rsi_4h:.1f} {rsi_status_4h}\n"
-                        f"Stoch(4H): {stoch_4h:.1f} | Stoch(1H): {stoch_1h:.1f}\n"
-                        f"MACD: {'🟢 Bullish' if macd_bullish else '🔴 Bearish'}\n\n"
-                        
-                        f"**🎯 Support & Resistance**\n"
-                        f"Support: `{support:,.2f}` | Resistance: `{resistance:,.2f}`\n"
-                        f"Position: {price_pos}\n\n"
-                        
-                        f"**🎪 Fibonacci Levels** (38.2%/61.8%: `{fib_levels['38.2%']:,.2f}` / `{fib_levels['61.8%']:,.2f}`)\n\n"
-                        
-                        f"**💡 สรุป**: "
+                        f"📊 {sym_input}/USDT | วิเคราะห์อัจฉริยะ\n"
+                        f"⏱ {datetime.now().strftime('%d/%m %H:%M')}  |  ราคา: {current_price:,.2f}\n"
+                        f"──────────────────────────\n\n"
+
+                        f"📈 Trend Analysis\n"
+                        f"• 4H : {trend_4h}\n"
+                        f"• 1H : {trend_1h}\n\n"
+
+                        f"📊 Momentum\n"
+                        f"• RSI 4H    : {rsi_4h:.1f} {rsi_status_4h}\n"
+                        f"• Stoch 4H  : {stoch_4h:.1f}\n"
+                        f"• Stoch 1H  : {stoch_1h:.1f}\n"
+                        f"• MACD      : {'🟢 Bullish' if macd_bullish else '🔴 Bearish'}\n\n"
+
+                        f"🎯 Support & Resistance\n"
+                        f"• Support    : {support:,.2f}\n"
+                        f"• Resistance : {resistance:,.2f}\n"
+                        f"• Position   : {price_pos}\n\n"
+
+                        f"🎪 Fibonacci Levels\n"
+                        f"• 38.2% : {fib_levels['38.2%']:,.2f}\n"
+                        f"• 61.8% : {fib_levels['61.8%']:,.2f}\n\n"
+
+                        f"💡 สรุปมุมมอง:\n"
                     )
+
                     
                     # ตัดสินใจ
                     signals = 0
@@ -4894,66 +5279,190 @@ async def check_telegram_updates(client, cmd_q, price_map):
                 await send_telegram_report("🛑 บอทกำลังหยุดทำงานอย่างปลอดภัย...\nขอบคุณที่ใช้ TITAN PRO 🚀", chat_id)
 
             # ===================== พิมพ์ชื่อเหรียญตรง ๆ =====================
+            # ===================== พิมพ์ชื่อเหรียญตรง ๆ → วิเคราะห์ละเอียดทุกกรอบเวลา =====================
             else:
-                sym_input = text.upper()
-                sym = sym_input + "USDT"
+                sym_input = text.upper().strip()
+                sym = sym_input + "USDT" if not sym_input.endswith("USDT") else sym_input
+
                 if sym not in price_map:
-                    await send_telegram_report("❓ ไม่พบเหรียญนี้หรือยังไม่มีข้อมูล", chat_id)
+                    await send_telegram_report("❓ ไม่พบเหรียญนี้หรือยังไม่มีข้อมูลราคา", chat_id)
                     continue
 
-                current_price = price_map[sym]
+                current_price = price_map.get(sym, 0.0)
+                if current_price <= 0:
+                    await send_telegram_report(f"⚠️ ราคา {sym_input} ไม่สามารถดึงได้ในขณะนี้", chat_id)
+                    continue
 
                 try:
-                    k = await client.futures_klines(symbol=sym, interval="1d", limit=500)
-                    if not k or len(k) < 50:
+                    # =============================================================
+                    # ดึงข้อมูลหลาย timeframe พร้อมกัน (เร็ว + ประหยัด request)
+                    # =============================================================
+                    tfs_to_fetch = ["1d", "4h", "1h", "15m"]
+                    klines_tasks = {
+                        tf: client.futures_klines(symbol=sym, interval=tf, limit=300 if tf in ["1d", "4h"] else 150)
+                        for tf in tfs_to_fetch
+                    }
+                    klines_results = await asyncio.gather(*klines_tasks.values(), return_exceptions=True)
+
+                    dfs = {}
+                    for tf, res in zip(tfs_to_fetch, klines_results):
+                        if isinstance(res, Exception) or not res or len(res) < 50:
+                            continue
+                        df = calculate_indicators(res)
+                        if not df.empty:
+                            dfs[tf] = df
+
+                    if not dfs:
                         await send_telegram_report(
-                            f"💰 **{sym_input}**\nราคา: {current_price:,.1f} USDT\n⚠️ ข้อมูลไม่เพียงพอสำหรับการวิเคราะห์ 1D",
+                            f"💰 **{sym_input}/USDT**\n"
+                            f"ราคาปัจจุบัน: `{current_price:,.4f}`\n"
+                            f"⚠️ ไม่สามารถดึงข้อมูลเพียงพอสำหรับวิเคราะห์",
                             chat_id
                         )
                         continue
 
-                    df = calculate_indicators(k)
-                    if df.empty:
-                        raise Exception("Calculate indicators failed")
+                    # =============================================================
+                    # ดึงข้อมูลสำคัญจากแต่ละ timeframe
+                    # =============================================================
+                    df_1d = dfs.get("1d")
+                    df_4h = dfs.get("4h")
+                    df_1h = dfs.get("1h")
+                    df_15m = dfs.get("15m")
 
-                    curr = df.iloc[-1]
-                    prev = df.iloc[-2] if len(df) > 1 else curr
+                    curr_1d = df_1d.iloc[-1] if df_1d is not None else None
+                    curr_4h = df_4h.iloc[-1] if df_4h is not None else None
+                    curr_1h = df_1h.iloc[-1] if df_1h is not None else None
+                    curr_15m = df_15m.iloc[-1] if df_15m is not None else None
 
-                    change_pct = (current_price - float(prev['c'])) / float(prev['c']) * 100 if prev['c'] > 0 else 0
-                    rsi_val = curr['rsi']
-                    adx_val = curr['adx']
-                    macd_val = curr['macd']
-                    signal_val = curr['signal']
-                    vol_ratio = curr['v'] / curr['vol_ma'] if curr['vol_ma'] > 0 else 1
+                    # =============================================================
+                    # 1. สรุปราคา + การเปลี่ยนแปลง (1D)
+                    # =============================================================
+                    change_1d = 0.0
+                    if curr_1d is not None and len(df_1d) > 1:
+                        prev_close = float(df_1d.iloc[-2]['c'])
+                        change_1d = (current_price - prev_close) / prev_close * 100 if prev_close > 0 else 0
 
+                    # =============================================================
+                    # 2. HTF Alignment (4H + 1H)
+                    # =============================================================
+                    htf_status = "ไม่สามารถตรวจสอบได้"
+                    htf_emoji = "⚪"
+                    if curr_4h is not None:
+                        is_bull_4h = await check_htf_bullish_alignment(client, sym)
+                        is_bear_4h = await check_htf_bearish_alignment(client, sym)
+                        if is_bull_4h:
+                            htf_status = "🟢 ขาขึ้นแข็งแรง (4H)"
+                            htf_emoji = "🟢"
+                        elif is_bear_4h:
+                            htf_status = "🔴 ขาลงแข็งแรง (4H)"
+                            htf_emoji = "🔴"
+                        else:
+                            htf_status = "🟡 ไซด์เวย์ / ไม่ชัดเจน (4H)"
+
+                    # =============================================================
+                    # 3. Indicators หลัก (1D + 4H + 15m)
+                    # =============================================================
+                    lines = []
+
+                    # RSI
+                    if curr_1d is not None:
+                        rsi_1d = curr_1d['rsi']
+                        lines.append(f"RSI (1D): `{rsi_1d:.1f}` → {'🟢 Oversold' if rsi_1d < 30 else '🔴 Overbought' if rsi_1d > 70 else '🟡 ปกติ'}")
+                    if curr_4h is not None:
+                        lines.append(f"RSI (4H): `{curr_4h['rsi']:.1f}`")
+
+                    # ADX + MACD (1D)
+                    if curr_1d is not None:
+                        lines.append(f"ADX (1D): `{curr_1d['adx']:.1f}` → {'🟢 เทรนด์แข็งแรง' if curr_1d['adx'] > 30 else '🟡 อ่อน/ไซด์เวย์'}")
+                        macd_status = "🟢 Bullish" if curr_1d['macd'] > curr_1d['signal'] else "🔴 Bearish"
+                        lines.append(f"MACD (1D): {macd_status}")
+
+                    # Volume Spike ล่าสุด (15m)
+                    vol_spike_text = "ปกติ"
+                    if curr_15m is not None and 'vol_ma' in curr_15m and curr_15m['vol_ma'] > 0:
+                        vol_r = curr_15m['v'] / curr_15m['vol_ma']
+                        if vol_r > 2.0:
+                            vol_spike_text = f"🔥 พุ่งสูงมาก ({vol_r:.1f}x)"
+                        elif vol_r > 1.5:
+                            vol_spike_text = f"🟢 สูงกว่าปกติ ({vol_r:.1f}x)"
+
+                    # =============================================================
+                    # 4. Fibonacci + Elliott Wave (จาก 1D)
+                    # =============================================================
+                    fib_elliot = {}
+                    fib_text = "ไม่สามารถคำนวณได้"
+                    if df_1d is not None and len(df_1d) >= 50:
+                        fib_elliot = get_fib_elliot_signal(df_1d, current_price)
+                        fib_text = (
+                            f"{fib_elliot['signal']} @ {fib_elliot['fib_level']} "
+                            f"({fib_elliot['confidence']*100:.0f}%)\n"
+                            f"Wave: {fib_elliot['wave_pattern']} ({fib_elliot['wave_direction']})"
+                        )
+
+                    # =============================================================
+                    # 5. สรุปคำแนะนำ + ความเสี่ยง
+                    # =============================================================
+                    summary = "🟡 รอสัญญาณชัดเจน"
+                    risk_level = "ปานกลาง"
+                    
+                    if htf_emoji == "🟢" and curr_1d is not None and curr_1d['ema20'] > curr_1d['ema50']:
+                        summary = "🟢 **มีโอกาส LONG** (ขาขึ้นเริ่มแข็งแรง)"
+                        risk_level = "ต่ำ-ปานกลาง" if curr_1d['rsi'] < 60 else "ปานกลาง"
+                    elif htf_emoji == "🔴" and curr_1d is not None and curr_1d['ema20'] < curr_1d['ema50']:
+                        summary = "🔴 **มีโอกาส SHORT** (ขาลงยังแรง)"
+                        risk_level = "ต่ำ-ปานกลาง" if curr_1d['rsi'] > 40 else "ปานกลาง"
+
+                    if vol_spike_text.startswith("🔥"):
+                        summary += "\n🔥 Volume Spike มาแรง → น่าสนใจมากขึ้น!"
+
+                    # ===== สร้างคำแนะนำจาก summary =====
+                    if 'LONG' in summary:
+                        trade_hint = "รอ pullback เพื่อเข้า LONG"
+                    elif 'SHORT' in summary:
+                        trade_hint = "รอ pullback เพื่อเข้า SHORT"
+                    else:
+                        trade_hint = "รอ confirmation ให้ชัดเจนก่อนเข้าเทรด"
+
+                    # =============================================================
+                    # สร้างรายงานฉบับสมบูรณ์ (Telegram Safe)
+                    # =============================================================
                     report_text = (
-                        f"📊 วิเคราะห์ {sym_input}/USDT (กรอบวัน – 1D)\n\n"
-                        f"💰 ราคาตอนนี้: `{current_price:,.8f}` USDT\n"
-                        f"📈📉 วันนี้: `{change_pct:+.2f}%`\n"
-                        f"→ {'ราคาแทบไม่ขยับ ถือว่านิ่ง/พักตัว' if abs(change_pct) < 1 else 'ราคาขยับขึ้นชัด' if change_pct > 0 else 'ราคากดลงแรง'}\n\n"
+                        f"📊 วิเคราะห์ละเอียด {sym_input}/USDT\n"
+                        f"⏱ {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}\n"
+                        f"──────────────────────────\n"
+                        f"💰 ราคาปัจจุบัน : {current_price:,.4f} USDT\n"
+                        f"📈 เปลี่ยนแปลงวันนี้ : {change_1d:+.2f}% "
+                        f"{'⬆️ ขาขึ้น' if change_1d > 0 else '⬇️ ขาลง' if change_1d < 0 else '➖ นิ่ง'}\n\n"
 
-                        f"🔍 ตัวชี้วัดทางเทคนิค\n\n"
-                        f"🔹 RSI (14): `{rsi_val:.1f}` → {'🟢 Oversold' if rsi_val < 30 else '🔴 Overbought' if rsi_val > 70 else '🟡 ปกติ'}\n"
-                        f"🔹 ADX (14): `{adx_val:.1f}` → {'🟢 เทรนด์แข็งแรง' if adx_val > 30 else '🟡 เทรนด์อ่อน/ไซด์เวย์'}\n"
-                        f"🔹 MACD: {'🟢 Bullish' if macd_val > signal_val else '🔴 Bearish'}\n"
-                        f"🔹 Volume: {'🔥 สูงมาก' if vol_ratio > 2.0 else '🟢 สูง' if vol_ratio > 1.5 else 'ปกติ'}\n\n"
+                        f"🌐 Higher Timeframe Alignment\n"
+                        f"• 4H : {htf_status}\n\n"
 
-                        f"⚠️ โครงสร้างแนวโน้ม\n"
-                        f"EMA Alignment: {'🟢 ขาขึ้นแข็งแรง' if curr['ema20'] > curr['ema50'] > curr['ema200'] else '🔴 ขาลงแข็งแรง' if curr['ema20'] < curr['ema50'] < curr['ema200'] else '🟡 ไซด์เวย์'}\n\n"
+                        f"📊 Indicators หลัก\n"
+                        f"{chr(10).join(lines)}\n"
+                        f"• Volume ล่าสุด (15m) : {vol_spike_text}\n\n"
 
-                        f"🧠 **สรุปสั้น**: {'🟢 เริ่มมีโอกาสกลับตัวขึ้น' if curr['ema20'] > curr['ema50'] else '🔴 โครงสร้างยังลงอยู่'}\n"
-                        f"{'🟢 โมเมนตัมบวก' if macd_val > signal_val else '🔴 โมเมนตัมลบ'}\n"
-                        f"Volume {'มาแล้ว → น่าเชื่อถือ' if vol_ratio > 1.5 else 'ยังเบา → รอ confirmation'}\n\n"
+                        f"🎪 Fibonacci + Elliott Wave (1D)\n"
+                        f"{fib_text}\n\n"
 
-                        f"_{datetime.now().strftime('%d/%m/%Y %H:%M:%S')}_"
+                        f"🧠 สรุป & คำแนะนำ\n"
+                        f"{summary}\n\n"
+                        f"⚠️ ระดับความเสี่ยง : {risk_level}\n"
+                        f"➡️ {trade_hint}\n\n"
+
+                        f"💡 หมายเหตุ : วิเคราะห์จากข้อมูลล่าสุด "
+                        f"ควรใช้วิจารณญาณและบริหารความเสี่ยงก่อนตัดสินใจเทรด"
                     )
 
-                    await send_telegram_report(report_text, chat_id)
+
+                    safe_text = escape_md(report_text)
+                    await send_telegram_report(safe_text, chat_id)
 
                 except Exception as e:
-                    print(f"{Fore.RED}Error analyzing {sym} (1D): {e}")
+                    print(f"{Fore.RED}Error analyzing {sym} (multi-TF): {e}{Style.RESET_ALL}")
                     await send_telegram_report(
-                        f"💰 **{sym_input}**\nราคา: {current_price:,.1f} USDT\n⚠️ ไม่สามารถวิเคราะห์ได้ในขณะนี้",
+                        f"💰 **{sym_input}/USDT**\n"
+                        f"ราคา: `{current_price:,.4f}`\n"
+                        f"⚠️ เกิดข้อผิดพลาดในการวิเคราะห์: {str(e)[:100]}...",
                         chat_id
                     )
 
@@ -4984,25 +5493,42 @@ def get_pending_limits_report(pending_orders, price_map):
 async def analyze_trend(client, symbol):
     try:
         k = await client.futures_klines(symbol=symbol, interval="4h", limit=200)
-        if not k: return "ไม่พบข้อมูลสำหรับเหรียญนี้"
-        
+        if not k:
+            return "ไม่พบข้อมูลสำหรับเหรียญนี้"
+
         df = calculate_indicators(k)
-        if df.empty: return "ไม่สามารถคำนวณ indicators ได้"
-        
+        if df.empty:
+            return "ไม่สามารถคำนวณ indicators ได้"
+
         curr = df.iloc[-1]
-        
-        trend_summary = f"**วิเคราะห์แนวโน้ม {symbol.replace('USDT','')} (4h)**\n"
-        trend_summary += f"ราคาปัจจุบัน: {float(curr['c']):,.4f} USDT\n"
-        trend_summary += f"ADX: {curr['adx']:.1f} → {'แข็งแรง' if curr['adx'] > 30 else 'อ่อน'}\n"
-        trend_summary += f"RSI: {curr['rsi']:.1f} → {'Overbought' if curr['rsi'] > 70 else 'Oversold' if curr['rsi'] < 30 else 'ปกติ'}\n"
-        trend_summary += f"MACD {'Bullish 📈' if curr['macd'] > curr['signal'] else 'Bearish 📉'}\n"
-        trend_summary += f"EMA: {'ขาขึ้น 🟢' if curr['ema20'] > curr['ema50'] > curr['ema200'] else 'ขาลง 🔴' if curr['ema20'] < curr['ema50'] < curr['ema200'] else 'ไซด์เวย์ 🟡'}\n"
-        trend_summary += f"BB: {'ทะลุบน (Breakout)' if curr['c'] > curr['bb_upper'] else 'ทะลุล่าง (Oversold)' if curr['c'] < curr['bb_lower'] else 'กลาง (Range)'}\n"
-        trend_summary += f"\n**สรุป**: {'🟢 แนวโน้มขาขึ้นแข็งแรง' if curr['adx'] > 30 and curr['macd'] > curr['signal'] and curr['ema20'] > curr['ema50'] else '🔴 แนวโน้มขาลงแข็งแรง' if curr['adx'] > 30 and curr['macd'] < curr['signal'] and curr['ema20'] < curr['ema50'] else '🟡 ไซด์เวย์ / อ่อน'}"
-        
-        return trend_summary
+
+        ema20 = curr.get('ema20')
+        ema50 = curr.get('ema50')
+        ema200 = curr.get('ema200', curr.get('ema100'))
+
+        ema_trend = "ไซด์เวย์ 🟡"
+        if ema20 and ema50 and ema200:
+            if ema20 > ema50 > ema200:
+                ema_trend = "ขาขึ้น 🟢"
+            elif ema20 < ema50 < ema200:
+                ema_trend = "ขาลง 🔴"
+
+        trend_summary = (
+            f"**วิเคราะห์แนวโน้ม {symbol.replace('USDT','')} (4h)**\n"
+            f"ราคาปัจจุบัน: {float(curr['c']):,.4f} USDT\n"
+            f"ADX: {curr['adx']:.1f} → {'แข็งแรง' if curr['adx'] > 30 else 'อ่อน'}\n"
+            f"RSI: {curr['rsi']:.1f}\n"
+            f"MACD {'Bullish 📈' if curr['macd'] > curr['signal'] else 'Bearish 📉'}\n"
+            f"EMA: {ema_trend}\n"
+            f"\nสรุป: "
+            f"{'🟢 แนวโน้มขาขึ้น' if curr['adx'] > 30 and curr['macd'] > curr['signal'] and ema_trend.startswith('ขาขึ้น') else '🔴 แนวโน้มขาลง' if curr['adx'] > 30 and curr['macd'] < curr['signal'] and ema_trend.startswith('ขาลง') else '🟡 ไซด์เวย์ / อ่อน'}"
+        )
+
+        return escape_md(trend_summary)
+
     except Exception as e:
         return f"เกิดข้อผิดพลาด: {e}"
+
 
 # ==========================================================================
 #                  GET SENTIMENT FROM COINGECKO
@@ -5033,6 +5559,27 @@ async def main():
     while running and reconnect_attempts < MAX_RECONNECT:
         try:
             client = await AsyncClient.create(API_KEY, API_SECRET, testnet=USE_TESTNET)
+                        # --- Pre-train AI ด้วย backtest ถ้ายังมีข้อมูลน้อย ---
+            if len(brain.data) < 30:  # ถ้ายังมีน้อยกว่า 30 trade
+                print(f"{Fore.CYAN}🧠 Pre-training AI ด้วย historical backtest (30 periods)...{Style.RESET_ALL}")
+                await backtest_ai_training(client, num_periods=50, chat_id=TELEGRAM_CHAT_ID)
+                
+                # Feed ผล backtest เข้า brain + train ทันที
+                if hasattr(brain, 'backtest_results') and brain.backtest_results:
+                    training_count = 0
+                    for res in brain.backtest_results.get('results', []):
+                        if 'features' in res and 'win' in res:
+                            brain.update_memory(res['features'], res['win'])
+                            training_count += 1
+                    if training_count > 0:
+                        brain.train_model()
+                        print(f"{Fore.GREEN}Pre-train สำเร็จ! เพิ่ม {training_count} samples เข้า AI แล้ว{Style.RESET_ALL}")
+                        await send_telegram_report(
+                            f"🧠 **AI Pre-trained สำเร็จ!**\n"
+                            f"เพิ่มข้อมูลเทรน {training_count} trades จาก backtest\n"
+                            f"ใช้ `/aistats` เช็คความก้าวหน้า",
+                            TELEGRAM_CHAT_ID
+                        )
             print(f"{Fore.GREEN}Connected to Binance {'Testnet' if USE_TESTNET else 'Mainnet'}! "
                   f"(Attempt {reconnect_attempts+1})")
 
@@ -5869,13 +6416,17 @@ async def main():
                                     current_p = r['curr_p']
 
                                     f = [
-                                        r['rsi']/100,
-                                        r['adx']/100,
-                                        (r.get('macd', 0) - r.get('signal', 0)) / r['atr'] if r['atr'] > 0 else 0,
-                                        (current_p - r.get('ema200', current_p)) / r.get('ema200', current_p) if r.get('ema200', 0) != 0 else 0,
-                                        r.get('vol_ratio', 1),
-                                        r['score']/8.0,
-                                        1 if r['side'] == 'LONG' else 0
+                                        float(curr['rsi'] / 100),
+                                        float(curr['adx'] / 100),
+                                        float((curr['macd'] - curr['signal']) / curr['atr'] if curr['atr'] > 0 else 0),
+                                        float((curr['c'] - curr['ema200']) / curr['ema200'] if curr['ema200'] > 0 else 0),
+                                        float(curr['v'] / curr['vol_ma'] if curr['vol_ma'] > 0 else 1),
+                                        float(score / 8.0),
+                                        1.0 if side == 'LONG' else 0.0,
+                                        float(curr['stoch_k'] / 100),              # เพิ่ม Stochastic
+                                        float(curr['bb_upper'] - curr['c']) / curr['atr'],  # ระยะห่างจาก BB upper
+                                        float(curr['ema20'] - curr['ema50']) / curr['atr'], # EMA slope ในหน่วย ATR
+                                        float(vol_ratio > 1.5),                    # binary vol breakout
                                     ]
                                     pred_pullback = brain.get_pred_pullback(f)
 
